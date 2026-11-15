@@ -44,6 +44,7 @@ export default class Server {
         this.state = '';
         this.userStat = new Map();
         this.banUsers = [];
+        this.onConnect = () => {};
     }
 
     // —— 生命周期 ——
@@ -264,8 +265,9 @@ SELECT changes() AS changes;`);
 
         result.serverKey = this.self.public_key;
         result.wgPort = this.wgPort;
-        result.peers = await this.members();
+        result.peers = (await this.members()).map(this._toMember);
 
+        this.onConnect();
         return result;
     }
 
@@ -327,6 +329,14 @@ SELECT changes() AS changes;`);
         return rows;
     }
 
+    async users() {
+        const rows = await this.db.all(
+            `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
+            WHERE status IN (${ST_BANNED}, ${ST_NORMAL}) AND id <> ${LOCAL_ID}`,
+        );
+        return rows;
+    }
+
     // 池内最小空闲 IP（10.84.111.2 ~ 254）
     async _allocIp() {
         const rows = await this.db.all(
@@ -343,16 +353,16 @@ SELECT changes() AS changes;`);
     }
 
     // —— 封禁：id 或 publicKey 都收 ——
-    async ban(id = 0, publicKey = '') {
+    async ban(publicKey = '', id = 0) {
         return this._setStatus(id, publicKey, ST_BANNED);
     }
 
     // —— 删除（软删除，保留整行以便审计）——
-    async remove(id = 0, publicKey = '') {
+    async remove(publicKey = '', id = 0) {
         return this._setStatus(id, publicKey, ST_DELETED);
     }
 
-    async resume(id = 0, publicKey = '') {
+    async resume(publicKey = '', id = 0) {
         return this._setStatus(id, publicKey, ST_NORMAL);
     }
 
@@ -361,7 +371,7 @@ SELECT changes() AS changes;`);
 
         if (!isPublicKey(publicKey) && !byId) return false;
 
-        const where = Number.isInteger(byId) ? `id = ${sqlNum(byId)} AND id <> ${LOCAL_ID}` : `public_key = ${sqlStr(publicKey)}`;
+        const where = isPublicKey(publicKey) ? `public_key = ${sqlStr(publicKey)}` : `id = ${sqlNum(byId)} AND id <> ${LOCAL_ID}`;
         const changes = await this._changes(`UPDATE users SET status = ${sqlNum(status)} WHERE ${where}`);
 
         this._getBanUsers().then((list) => {

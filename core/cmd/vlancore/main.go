@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const listenAddr = "127.0.0.1:7400"
@@ -96,11 +97,80 @@ func tunnelUp(name, conf string, port int) (string, error) {
 		return "", fmt.Errorf("安装隧道失败: %v %s", err, strings.TrimSpace(out))
 	}
 
+	// installtunnelservice 只要把服务注册上就返回 0 —— 配置有问题时服务会立刻退出，
+	// 网卡根本不会出现，但调用方看到的是成功。这里必须再确认服务真的 RUNNING。
+	if err := waitTunnelRunning(name, 6*time.Second); err != nil {
+		runWG(exe, "/uninstalltunnelservice", name) // 别留一个起不来的服务
+		return "", fmt.Errorf("%v%s", err, tunnelLogTail(name))
+	}
+
 	mu.Lock()
 	tunnels[name] = p
 	mu.Unlock()
 	log.Printf("tunnel up: %s -> %s", name, p)
 	return p, nil
+}
+
+// 轮询服务状态，直到 RUNNING / 超时
+func waitTunnelRunning(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	last := "unknown"
+
+	for {
+		state, err := tunnelServiceState(name)
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = state
+			if state == "RUNNING" {
+				return nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("隧道服务没有跑起来（状态 %s），常见原因：Address/ListenPort 和已有隧道冲突、PrivateKey 非法、端口被占用", last)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// sc query WireGuardTunnel$<name> → RUNNING / STOPPED / START_PENDING …
+func tunnelServiceState(name string) (string, error) {
+	out, err := exec.Command("sc.exe", "query", "WireGuardTunnel$"+name).CombinedOutput()
+	text := string(out)
+	if err != nil && !strings.Contains(text, "STATE") {
+		return "", fmt.Errorf("查不到服务: %s", strings.TrimSpace(firstLine(text)))
+	}
+	// STATE              : 4  RUNNING
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.Contains(line, "STATE") {
+			continue
+		}
+		fields := strings.Fields(strings.SplitN(line, ":", 2)[1])
+		if len(fields) >= 2 {
+			return fields[1], nil
+		}
+	}
+	return "", fmt.Errorf("无法解析服务状态")
+}
+
+// 隧道日志：C:\Program Files\WireGuard\Data\Logs\<name>.log，读不到就返回空
+func tunnelLogTail(name string) string {
+	p := filepath.Join(`C:\Program Files\WireGuard\Data\Logs`, name+".log")
+	b, err := os.ReadFile(p)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\r\n"), "\n")
+	if len(lines) > 8 {
+		lines = lines[len(lines)-8:]
+	}
+	return "\n最近日志:\n" + strings.Join(lines, "\n")
+}
+
+func firstLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return lines[0]
 }
 
 // 关虚拟网卡
@@ -111,6 +181,14 @@ func tunnelDown(name string) error {
 	exe := wireguardExe()
 	if exe == "" {
 		return fmt.Errorf("找不到 wireguard.exe")
+	}
+
+	// 服务本来就不存在：当作成功（幂等）
+	if _, err := tunnelServiceState(name); err != nil {
+		mu.Lock()
+		delete(tunnels, name)
+		mu.Unlock()
+		return nil
 	}
 
 	out, err := runWG(exe, "/uninstalltunnelservice", name)

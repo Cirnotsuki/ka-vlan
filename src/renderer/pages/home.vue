@@ -42,20 +42,36 @@
 
                     <div class="scroll">
                         <el-table :data="members" size="small" border stripe height="100%" empty-text="暂无成员" style="width: 100%">
-                            <!-- <el-table-column prop="id" label="ID" min-width="65" /> -->
-                            <el-table-column prop="name" label="昵称" min-width="120" />
-
-                            <el-table-column prop="vpn_ip" label="内网 IP" min-width="120" />
-
-                            <el-table-column prop="public_key" label="公钥" min-width="140" show-overflow-tooltip />
-
-                            <el-table-column label="操作" width="100" fixed="right">
+                            <el-table-column prop="id" label="ID" min-width="30" />
+                            <el-table-column label="昵称" min-width="120">
                                 <template slot-scope="scope">
-                                    <el-button type="text" style="color: #f56c6c" size="mini" @click="del(scope.row.public_key)">
-                                        删除
-                                    </el-button>
+                                    <el-popover trigger="hover" placement="top">
+                                        <p>公钥: {{ scope.row.public_key }}</p>
+                                        <p>IP: {{ scope.row.ip }}</p>
+                                        <div slot="reference" class="name-wrapper">
+                                            <el-tag size="medium" :type="scope.row.status === 0 ? 'danger' : ''">{{
+                                                scope.row.name
+                                            }}</el-tag>
+                                        </div>
+                                    </el-popover>
+                                </template>
+                            </el-table-column>
 
-                                    <el-button type="text" size="mini" class="ban" @click="ban(scope.row.public_key)"> 封禁 </el-button>
+                            <el-table-column prop="vpn_ip" label="内网 IP" min-width="120">
+                                <template slot-scope="scope">
+                                    <el-input v-model="scope.row.vpn_ip" placeholder="端口" style="width: 100%" />
+                                </template>
+                            </el-table-column>
+
+                            <el-table-column label="操作" width="160" fixed="right">
+                                <template slot-scope="scope">
+                                    <el-button type="success" size="mini" @click="resume(scope.row)" v-if="scope.row.status === 0"
+                                        >恢复</el-button
+                                    >
+                                    <el-button type="warning" size="mini" @click="ban(scope.row)" v-if="scope.row.status === 1"
+                                        >封禁</el-button
+                                    >
+                                    <el-button type="danger" size="mini" @click="remove(scope.row)">删除</el-button>
                                 </template>
                             </el-table-column>
                         </el-table>
@@ -195,13 +211,13 @@
 </template>
 
 <script>
-import './home.css';
+import './home.less';
 import Server from '../utils/server';
-import { generateKeyPair, getMachineGuid } from '../utils/helper';
+import { getMachineGuid } from '../utils/helper';
 // 对应 ui/index.html 的 Vue 页面版：
 // 状态全部走 vlancore 的 127.0.0.1:7400 HTTP API
 import {
-    DEFAULT_WG_PORT, DEFAULT_SERVER_PORT, SERVER_VPN_IP, NETWORK_NAME,
+    DEFAULT_WG_PORT, DEFAULT_SERVER_PORT, SERVER_VPN_IP, NETWORK_NAME, VPN_PREFIX,
 } from '../constants';
 
 // 虚拟网卡（WireGuard 隧道服务）名字：只在这个页面定义。
@@ -247,7 +263,6 @@ export default {
             coreOnline: false,
             // 测试用的客户端网卡是否已装
             testTunnelUp: false,
-
         };
     },
     computed: {
@@ -284,7 +299,7 @@ export default {
         async init() {
             await this.$db.init();
             const info = await Server.getInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
-            this.machineGuid = (await getMachineGuid() || '').replace(/-/g, '');
+            this.machineGuid = ((await getMachineGuid()) || '').replace(/-/g, '');
 
             this.nickName = info.name || '';
             this.vpnIp = info.vpn_ip || SERVER_VPN_IP;
@@ -358,29 +373,32 @@ export default {
             const self = (this.serverInst && this.serverInst.self) || {};
             if (!self.private_key) throw new Error('服务器密钥还没生成');
 
-            const peers = (await this.serverInst.members()).map(u => `
-[Peer]
-PublicKey = ${u.public_key}
-AllowedIPs = ${u.vpn_ip}/32
-            `);
-
-            return `
+            let conf = `
 [Interface]
 PrivateKey = ${self.private_key}
 ListenPort = ${this.wgPort}
 Address = ${SERVER_VPN_IP}/24
 MTU = 1280
 PostUp = iptables -A FORWARD -o wg0 -j ACCEPT
-PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -o wg0 -j ACCEPT`;
 
-${peers}`;
+            conf += (await this.serverInst.members()).map(
+                (u) => `
+                
+[Peer]
+PublicKey = ${u.public_key}
+AllowedIPs = ${u.vpn_ip}/32`,
+            );
+
+            console.log(conf);
+            return conf;
         },
 
         async buildClientConf(publicKey, vpnIp = SERVER_VPN_IP, endPoint = `${this.ip}:${this.wgPort}`) {
             const info = await Server.getInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
             if (!info.public_key) throw new Error('服务器公钥还没生成');
             const vpnIps = vpnIp.replace(/\d+$/, '');
-            return `
+            const conf = `
 [Interface]
 PrivateKey = ${info.private_key}
 Address = ${vpnIp}/24
@@ -390,8 +408,10 @@ MTU = 1280
 PublicKey = ${publicKey}
 AllowedIPs = ${vpnIps}0/24
 Endpoint = ${endPoint}
-PersistentKeepalive = 25
-            `;
+PersistentKeepalive = 25`;
+
+            console.log(conf);
+            return conf;
         },
 
         // 每段只留数字；超过 255 压回。跳转交给 Tab / 鼠标，不在这里碰 DOM
@@ -405,6 +425,17 @@ PersistentKeepalive = 25
             if (digits !== raw) this.$set(this.ipParts, index, digits);
         },
 
+        async onConnect() {
+            await this.refreshMenbers();
+        },
+
+        async refreshMenbers() {
+            if (!this.serverInst) return;
+            await this.serverInst.ready;
+
+            this.members = await this.serverInst.users();
+        },
+
         async doStartServe() {
             const serverPort = parseInt(this.serverPort, 10) || DEFAULT_WG_PORT;
             try {
@@ -415,15 +446,45 @@ PersistentKeepalive = 25
                 }
 
                 // 2) 再装虚拟网卡
-                await this.startTunnel(this.networkName, await this.buildServerConf());
+                const conf = await this.buildServerConf();
+                await this.startTunnel(this.networkName, conf);
                 this.tunnelUp = true;
                 this.serveKey = (this.serverInst.self && this.serverInst.self.public_key) || '';
+                this.serverInst.onConnect = this.onConnect;
+                await this.refreshMenbers();
+
                 this.mode = 'serve';
 
                 this.serverState = this.serverInst.state || '注册服务已就绪';
             } catch (e) {
                 this.$message.error(this.translateErr(e.message));
             }
+            this.pollState();
+        },
+
+        async stopServe() {
+            try {
+                await this.$confirm('停止服务并关闭端口？', '确认', { type: 'warning' });
+            } catch (e) {
+                return; // 用户取消
+            }
+
+            try {
+                // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
+                await this.stopTunnel(this.networkName);
+                this.tunnelUp = false;
+            } catch (e) {
+                this.$message.error(this.translateErr(e.message));
+            }
+
+            if (this.serverInst) {
+                await this.serverInst.stop().catch(() => {});
+                this.serverInst = null;
+            }
+
+            this.mode = 'idle';
+            this.statusMsg = '';
+            this.members = [];
             this.pollState();
         },
 
@@ -442,8 +503,7 @@ PersistentKeepalive = 25
                 // });
                 // await Server.updateInfo(this.$db, this.nickName || '', res.server, `${this.ip}:${serverPort}`);
                 // this.wgPort = res.port;
-                const conf = await this.buildClientConf('pk', '10.100.0.2', `${this.ip}:${this.wgPort}`);
-                console.log(conf);
+                const conf = await this.buildClientConf(info.public_key, `${VPN_PREFIX}2`, `${this.ip}:${this.wgPort}`);
 
                 await this.startTunnel(this.networkName, conf);
                 this.tunnelUp = true;
@@ -472,31 +532,6 @@ PersistentKeepalive = 25
             }
             this.mode = 'idle';
 
-            this.pollState();
-        },
-        async stopServe() {
-            try {
-                await this.$confirm('停止服务并关闭端口？', '确认', { type: 'warning' });
-            } catch (e) {
-                return; // 用户取消
-            }
-
-            try {
-                // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
-                await this.stopTunnel(this.networkName);
-                this.tunnelUp = false;
-            } catch (e) {
-                this.$message.error(this.translateErr(e.message));
-            }
-
-            if (this.serverInst) {
-                await this.serverInst.stop().catch(() => {});
-                this.serverInst = null;
-            }
-
-            this.mode = 'idle';
-            this.statusMsg = '';
-            this.members = [];
             this.pollState();
         },
 
@@ -528,12 +563,35 @@ PersistentKeepalive = 25
             return result;
         },
 
-        async ban(pk) {
-            await this.post('/api/ban', { publicKey: pk }).catch(() => {});
+        async resume(row) {
+            if (!this.serverInst) return;
+            await this.serverInst.ready;
+
+            this.serverInst.resume(row.public_key);
+            this.refreshMenbers();
             this.pollState();
         },
-        async del(pk) {
-            await this.post('/api/delete', { publicKey: pk }).catch(() => {});
+
+        async ban(row) {
+            if (!this.serverInst) return;
+            await this.serverInst.ready;
+
+            this.serverInst.ban(row.public_key);
+            this.refreshMenbers();
+            this.pollState();
+        },
+        async remove(row) {
+            if (!this.serverInst) return;
+            await this.serverInst.ready;
+
+            try {
+                await this.$confirm(`删除用户: ${row.name}(${row.vpn_ip})？`, '确认', { type: 'warning' });
+            } catch (e) {
+                return; // 用户取消
+            }
+
+            this.serverInst.remove(row.public_key);
+            this.refreshMenbers();
             this.pollState();
         },
 
@@ -584,36 +642,3 @@ PersistentKeepalive = 25
     },
 };
 </script>
-
-<style scoped>
-/* 四个 IP 段：均分可用宽度，点夹在中间，整体与右侧端口框同高 */
-.ip-octets {
-    display: flex;
-    align-items: center;
-    background-color: #f5f7fa;
-    border: 1px solid #dcdfe6;
-    border-radius: 4px;
-}
-.ip-octets .ip-octet {
-    flex: 1 1 0;
-    min-width: 0;
-}
-.ip-octets .ip-dot {
-    flex: none;
-    font-weight: 600;
-    user-select: none;
-    background-color: #f5f7fa;
-    color: #909399;
-    vertical-align: middle;
-    display: table-cell;
-    position: relative;
-    padding: 0 6px;
-    white-space: nowrap;
-}
-.ip-octets ::v-deep .el-input__inner {
-    text-align: center;
-    padding: 0 2px;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 1px;
-}
-</style>
