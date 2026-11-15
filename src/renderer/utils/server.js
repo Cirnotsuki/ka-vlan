@@ -51,11 +51,31 @@ export default class Server {
     async start() {
         await this.db.init();
         await this._ensureSelf();
+        await this._ensureVpnIpUnique();
         await this._listen();
         this.banUsers = await this._getBanUsers();
         this.startedAt = Date.now();
-        this.state = `注册服务已监听:${this.serverPort}\n服务器公钥:${this.self.public_key}`;
+        // 唯一索引建失败时 _ensureVpnIpUnique 已经写过原因，别覆盖掉
+        this.state = this.state || `注册服务已监听:${this.serverPort}\n服务器公钥:${this.self.public_key}`;
         return this;
+    }
+
+    // vpn_ip 唯一索引：并发 join 时由 SQLite 兜底，防止两个客户端拿到同一个内网地址。
+    // 老库里如果已经有重复数据，建索引会失败 —— 这里吞掉，不因为一个索引阻止服务启动。
+    async _ensureVpnIpUnique() {
+        try {
+            await this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vpn_ip_unique ON users(vpn_ip) WHERE vpn_ip IS NOT NULL;');
+        } catch (e) {
+            this.state = `vpn_ip 唯一索引未建立（可能存在历史重复数据）: ${e.message}`;
+        }
+    }
+
+    // 把「分配地址 + 插入」串行化：sqlite 是子进程，读和写之间没有事务保护，
+    // 两个 join 同时进来会读同一份 used 集合，于是分到同一个 IP。
+    _withAllocLock(fn) {
+        const run = (this._allocChain || Promise.resolve()).then(() => fn());
+        this._allocChain = run.catch(() => {});
+        return run;
     }
 
     _listen() {
@@ -250,35 +270,55 @@ SELECT changes() AS changes;`);
 
             result.vpnIp = row.vpn_ip;
         } else {
+            result.vpnIp = await this._withAllocLock(() => this._insertNewUser({
+                nickName,
+                publicKey,
+                guid,
+                userIp,
+            }));
+        }
+
+        result.serverKey = this.self.public_key;
+        result.wgPort = this.wgPort;
+        result.peers = (await this.members()).map((u) => this._toMember(u));
+
+        this.onConnect();
+        return result;
+    }
+
+    // 分配 + 插入（调用方必须套 _withAllocLock）。
+    // 加了唯一索引后，即便分配仍然撞车，INSERT 会因 UNIQUE 失败，这里换一个地址重试。
+    async _insertNewUser({
+        nickName, publicKey, guid, userIp,
+    }) {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
             const vpnIp = await this._allocIp();
             if (!vpnIp) {
                 throw Object.assign(new Error('可分配地址已耗尽'), { status: 507 });
             }
 
-            // last_insert_rowid() 是连接级的，必须和 INSERT 放在同一次 exec 里取，否则另起进程拿到 0
-            await this.db.all(
-                `INSERT INTO users (name, public_key, private_key, ip, vpn_ip, guid, status, create_date)
-                 VALUES (
-                    ${sqlStr(nickName)}, 
-                    ${sqlStr(publicKey)}, 
-                    NULL,
-                    ${sqlStr(userIp)},
-                    ${sqlStr(vpnIp)}, 
-                    ${sqlStr(guid)}, 
-                    ${ST_NORMAL}, 
-                    datetime('now')
-                );`,
-            );
-
-            result.vpnIp = vpnIp;
+            try {
+                await this.db.exec(
+                    `INSERT INTO users (name, public_key, private_key, ip, vpn_ip, guid, status, create_date)
+                     VALUES (
+                        ${sqlStr(nickName)},
+                        ${sqlStr(publicKey)},
+                        NULL,
+                        ${sqlStr(userIp)},
+                        ${sqlStr(vpnIp)},
+                        ${sqlStr(guid)},
+                        ${ST_NORMAL},
+                        datetime('now')
+                    );`,
+                );
+                return vpnIp;
+            } catch (e) {
+                const msg = (e && e.message) || '';
+                if (!/unique|constraint/i.test(msg)) throw e; // 不是地址冲突，直接抛
+            }
         }
 
-        result.serverKey = this.self.public_key;
-        result.wgPort = this.wgPort;
-        result.peers = (await this.members()).map(this._toMember);
-
-        this.onConnect();
-        return result;
+        throw Object.assign(new Error('地址分配冲突，请重试'), { status: 409 });
     }
 
     _refreshStat(publicKey) {

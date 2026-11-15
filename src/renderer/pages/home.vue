@@ -620,8 +620,20 @@ PersistentKeepalive = 25`;
 
                 this.serverState = this.serverInst.state || '注册服务已就绪';
             } catch (e) {
-                this.mode = 'idle';
-                this.$message.error(this.translateErr(e.message));
+                if (this.tunnelUp) {
+                    // 隧道已经装上了，只是后面的成员同步失败：
+                    // 别把界面打回 idle，否则会出现"界面显示没开、网卡却在跑"的不一致
+                    this.mode = 'serve';
+                    this.serverState = '隧道已就绪，成员同步失败';
+                    this.$message.warning(`隧道已就绪，但成员同步失败：${this.translateErr(e.message)}`);
+                } else {
+                    this.mode = 'idle';
+                    if (this.serverInst) {
+                        await this.serverInst.stop().catch(() => {});
+                        this.serverInst = null;
+                    }
+                    this.$message.error(this.translateErr(e.message));
+                }
             }
             this.pollState();
         },
