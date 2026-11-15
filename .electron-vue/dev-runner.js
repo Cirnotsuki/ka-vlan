@@ -90,7 +90,7 @@ function startRenderer() {
 
 function startMain() {
     return new Promise((resolve, reject) => {
-        mainConfig.entry.main = [path.join(__dirname, '../src/main/index.dev.js')].concat(mainConfig.entry.renderer);
+        mainConfig.entry.main = [path.join(__dirname, '../src/main/index.dev.js')].concat(mainConfig.entry.main);
         mainConfig.mode = 'development';
         const compiler = webpack(mainConfig);
 
@@ -134,7 +134,11 @@ function startElectron() {
         args = args.concat(process.argv.slice(2));
     }
 
-    electronProcess = spawn(electron, args);
+    // 360 按 exe 路径信誉拦截：node_modules 里新编译的 electron.exe 写 AppData 会被 EPERM，
+    // 改用 HRTB 老工程的 electron.exe（360 已信任的路径），可用 VLAN_DEV_ELECTRON 覆盖
+    const electronExe = process.env.VLAN_DEV_ELECTRON
+        || 'E:\\HR_Project\\HRTB\\electron22\\node_modules\\electron\\dist\\electron.exe';
+    electronProcess = spawn(electronExe, args);
 
     electronProcess.stdout.on('data', (data) => {
         electronLog(data, 'blue');

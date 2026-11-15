@@ -13,7 +13,7 @@ const devMode = process.env.NODE_ENV !== 'production';
 
 let mainConfig = {
     entry: {
-        renderer: path.join(__dirname, '../src/main/index.js')
+        main: path.join(__dirname, '../src/main/index.js')
     },
     externals: [ ...Object.keys(dependencies || {}) ],
     module: {

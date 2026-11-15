@@ -114,7 +114,7 @@ let webConfig = {
       '@': path.join(__dirname, '../src/renderer'),
       'static':path.resolve(__dirname, '../static'),
       'root':path.resolve(__dirname, '../'),
-      'vue$': path.resolve(__dirname, '../src/renderer/modules/vue/index.js')
+      'vue$': path.resolve(__dirname, '../src/renderer/modules/vue/cjs-entry.js')
     },
     extensions: ['.js', '.vue', '.json', '.css']
   },

@@ -1,10 +1,19 @@
-import Vue from './modules/vue/index';
+import ElementUI from 'element-ui';
+import Vue from './modules/vue/cjs-entry';
+
+import 'element-ui/lib/theme-chalk/index.css';
 import App from './App.vue';
 import router from './router/index';
-import store from './store';
+import SQLiteManager from './utils/sqlite';
+
+// import store from './store';
 
 // 创建全局变量
 Vue.prototype.$global = {};
+
+Vue.use(ElementUI);
+Vue.prototype.$api = 'http://127.0.0.1:7400';
+Vue.prototype.$db = new SQLiteManager();
 
 // 为 Vue 装载网络请求模块
 Vue.use(require('@/utils/myaxios').default);
@@ -32,6 +41,6 @@ process.env.NODE_ENV !== 'development' && process.on('uncaughtException', (err) 
 new Vue({
     components: { App },
     router,
-    store,
+    // store,
     template: '<App/>',
 }).$mount('#app');

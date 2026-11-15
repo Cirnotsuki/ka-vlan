@@ -39,7 +39,7 @@ function recursiveIssuer (m, c){
  * that provide pure *.vue files that need compiling
  * https://simulatedgreg.gitbooks.io/electron-vue/content/en/webpack-configurations.html#white-listing-externals
  */
-let whiteListedModules = [ 'vue' ];
+let whiteListedModules = [ 'vue', 'element-ui' ];
 let rendererConfig = {
     devtool: '#cheap-module-eval-source-map',
     entry: {
@@ -162,7 +162,7 @@ let rendererConfig = {
             '@': path.join(__dirname, '../src/renderer'),
             static: path.resolve(__dirname, '../static'),
             root: path.resolve(__dirname, '../'),
-            vue$: path.resolve(__dirname, '../src/renderer/modules/vue/index.js')
+            vue$: path.resolve(__dirname, '../src/renderer/modules/vue/cjs-entry.js')
         },
         extensions: [ '.js', '.vue', '.json', '.css', '.node' ]
     },

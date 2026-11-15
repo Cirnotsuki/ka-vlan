@@ -6,7 +6,7 @@
 
 <script>
 export default {
-    name: 'Electron-Vue Template',
+    name: 'vlan-network',
 };
 </script>
 
