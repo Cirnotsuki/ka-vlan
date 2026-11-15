@@ -182,7 +182,9 @@ function httpOK(p) {
 }
 
 async function startCore() {
-    if (await httpOK('/api/state')) {
+    // 探活只能用 /ping：精简后的核心没有 /api/state，用旧路径会一直判成"没起来"，
+    // 于是每次启动都再拉一个核心去抢 7400，老进程却一直占着端口
+    if (await httpOK('/ping')) {
         shellLog('startCore: 已有实例');
         return;
     }
@@ -196,7 +198,7 @@ async function startCore() {
     spawn('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true });
     for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 500));
-        if (await httpOK('/api/state')) {
+        if (await httpOK('/ping')) {
             shellLog(`startCore: 核心就绪 (等待 ${(i + 1) * 0.5}s)`);
             return;
         }

@@ -87,11 +87,11 @@ SELECT changes() AS changes;`);
 
     // —— 服务器自身（id=0）：没有就生成密钥写进去，之后一直复用 ——
     async _ensureSelf() {
-        this.self = await Server.getInfo(this.db, LOCAL_NAME, SERVER_VPN_IP);
+        this.self = await Server.getLocalInfo(this.db, LOCAL_NAME, SERVER_VPN_IP);
         return this.self;
     }
 
-    static async getInfo(db, nickName = LOCAL_NAME, serverVpnIp = SERVER_VPN_IP, ip = '') {
+    static async getLocalInfo(db, nickName = LOCAL_NAME, serverVpnIp = SERVER_VPN_IP, ip = '') {
         const rows = await db.all(`SELECT id, name, public_key, private_key, vpn_ip, ip FROM users WHERE id = ${LOCAL_ID} LIMIT 1`);
 
         if (rows.length) {
@@ -116,11 +116,11 @@ SELECT changes() AS changes;`);
         };
     }
 
-    static async updateInfo(db, nickName = LOCAL_NAME, serverVpnIp = SERVER_VPN_IP, ip = '') {
-        const info = await Server.getInfo(db, nickName, serverVpnIp, ip);
+    static async updateLocalInfo(db, nickName = LOCAL_NAME, vpnIp = SERVER_VPN_IP, ip = '') {
+        const info = await Server.getLocalInfo(db, nickName, vpnIp, ip);
 
         await db.exec(
-            `UPDATE users SET name = ${sqlStr(nickName)}, ip = ${sqlStr(ip)}, vpn_ip = ${sqlStr(serverVpnIp)}
+            `UPDATE users SET name = ${sqlStr(nickName)}, ip = ${sqlStr(ip)}, vpn_ip = ${sqlStr(vpnIp)}
              WHERE id = ${info.id};`,
         );
 
@@ -129,9 +129,16 @@ SELECT changes() AS changes;`);
             name: nickName,
             public_key: info.public_key,
             private_key: info.private_key,
-            vpn_ip: serverVpnIp,
+            vpn_ip: vpnIp,
             ip,
         };
+    }
+
+    async updateUserVpnIp(vpnIp, id) {
+        return this._changes(
+            `UPDATE users SET vpn_ip = ${sqlStr(vpnIp)}
+             WHERE id = ${sqlNum(id)};`,
+        );
     }
 
     async _getBanUsers() {
@@ -272,7 +279,13 @@ SELECT changes() AS changes;`);
     }
 
     _refreshStat(publicKey) {
-        this.userStat.set(publicKey, +new Date());
+        if (!this.userStat.has(publicKey)) {
+            this.userStat.set(publicKey, {
+                lastConnect: +new Date(),
+                lastHeartBeat: +new Date(),
+            });
+        }
+        this.userStat.get(publicKey).lastHeartBeat = +new Date();
     }
 
     // 获取客户端真实 IP
@@ -309,14 +322,20 @@ SELECT changes() AS changes;`);
 
     // 对外只暴露界面需要的字段
     _toMember(row) {
-        const lastConnect = this.userStat.get(row.public_key) || 0;
+        const stat = {
+            lastConnect: 0,
+            lastHeartBeat: 0,
+            ...this.userStat.get(row.public_key),
+        };
+
         const curTime = +new Date();
-        const keepHeartBeat = curTime - lastConnect < IS_LOST_CONNECT;
+        const keepHeartBeat = curTime - stat.lastHeartBeat < IS_LOST_CONNECT;
         const banded = this.banUsers.some((u) => u.guid === row.guid || u.publicKey === row.public_key || u.ip.indexOf(row.ip) >= 0);
 
         return {
             id: row.id,
             name: row.name || '匿名',
+            lastConnect: stat.lastConnect,
             online: keepHeartBeat && !banded,
         };
     }
@@ -324,7 +343,7 @@ SELECT changes() AS changes;`);
     async members() {
         const rows = await this.db.all(
             `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
-              WHERE status = ${ST_NORMAL} AND id <> ${LOCAL_ID}`,
+              WHERE status = ${ST_NORMAL} AND id <> ${LOCAL_ID} ORDER BY id ASC`,
         );
         return rows;
     }
@@ -332,9 +351,12 @@ SELECT changes() AS changes;`);
     async users() {
         const rows = await this.db.all(
             `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
-            WHERE status IN (${ST_BANNED}, ${ST_NORMAL}) AND id <> ${LOCAL_ID}`,
+            WHERE status IN (${ST_BANNED}, ${ST_NORMAL}) AND id <> ${LOCAL_ID} ORDER BY id ASC`,
         );
-        return rows;
+        return rows.map(u => ({
+            ...u,
+            ...this._toMember(u),
+        }));
     }
 
     // 池内最小空闲 IP（10.84.111.2 ~ 254）

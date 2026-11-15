@@ -251,6 +251,153 @@ type downReq struct {
 	Name string `json:"name"`
 }
 
+type peerReq struct {
+	Name string `json:"name"`
+	Conf string `json:"conf"`
+}
+
+// —— 热更新 peers：不重装隧道，直接 wg set ——
+// conf 会照样落盘（下次重装时不会丢成员），运行中的接口用 wg.exe 增量同步：
+//   wg set <name> peer <pub> allowed-ips <...> [endpoint <...>] [persistent-keepalive N]
+//   不在新 conf 里的旧 peer 用 `peer <pub> remove` 删掉
+type wgPeer struct {
+	publicKey  string
+	allowedIPs string
+	endpoint   string
+	keepalive  string
+}
+
+func parsePeers(conf string) []wgPeer {
+	var peers []wgPeer
+	inPeer := false
+
+	for _, raw := range strings.Split(conf, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inPeer = strings.HasPrefix(strings.ToLower(line), "[peer]")
+			if inPeer {
+				peers = append(peers, wgPeer{})
+			}
+			continue
+		}
+		if !inPeer {
+			continue
+		}
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		val := strings.TrimSpace(kv[1])
+		cur := &peers[len(peers)-1]
+		switch key {
+		case "publickey":
+			cur.publicKey = val
+		case "allowedips":
+			cur.allowedIPs = val
+		case "endpoint":
+			cur.endpoint = val
+		case "persistentkeepalive":
+			cur.keepalive = val
+		}
+	}
+	return peers
+}
+
+func wgExePath() string {
+	if p, err := exec.LookPath("wg.exe"); err == nil {
+		return p
+	}
+	if w, err := exec.LookPath("wireguard.exe"); err == nil {
+		cand := filepath.Join(filepath.Dir(w), "wg.exe")
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	for _, p := range []string{`C:\Program Files\WireGuard\wg.exe`, `C:\Program Files (x86)\WireGuard\wg.exe`} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+func tunnelSetPeers(name, conf string) (map[string]interface{}, error) {
+	if !nameRe.MatchString(name) {
+		return nil, fmt.Errorf("隧道名非法: %q", name)
+	}
+
+	wg := wgExePath()
+	if wg == "" {
+		return nil, fmt.Errorf("找不到 wg.exe")
+	}
+
+	// 1) conf 落盘：下次 /tunnel/up 重装时成员还在
+	dir := tunnelsDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("建隧道目录失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name+".conf"), []byte(conf), 0600); err != nil {
+		return nil, fmt.Errorf("写 conf 失败: %v", err)
+	}
+
+	want := parsePeers(conf)
+	if len(want) == 0 {
+		return nil, fmt.Errorf("conf 里没有 [Peer]")
+	}
+
+	// 2) 现有 peer（隧道没装或没跑会失败，直接报给调用方）
+	out, err := exec.Command(wg, "show", name, "peers").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("隧道 %s 不在运行（%v）%s", name, err, strings.TrimSpace(string(out)))
+	}
+
+	current := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if k := strings.TrimSpace(line); k != "" {
+			current[k] = true
+		}
+	}
+
+	// 3) 逐个 upsert
+	wantSet := map[string]bool{}
+	for _, p := range want {
+		if p.publicKey == "" || p.allowedIPs == "" {
+			continue
+		}
+		wantSet[p.publicKey] = true
+
+		args := []string{"set", name, "peer", p.publicKey, "allowed-ips", p.allowedIPs}
+		if p.endpoint != "" {
+			args = append(args, "endpoint", p.endpoint)
+		}
+		if p.keepalive != "" {
+			args = append(args, "persistent-keepalive", p.keepalive)
+		}
+		if o, e := exec.Command(wg, args...).CombinedOutput(); e != nil {
+			return nil, fmt.Errorf("wg set 失败: %v %s", e, strings.TrimSpace(string(o)))
+		}
+	}
+
+	// 4) 删掉已经不在名单里的 peer
+	removed := 0
+	for pk := range current {
+		if wantSet[pk] {
+			continue
+		}
+		if o, e := exec.Command(wg, "set", name, "peer", pk, "remove").CombinedOutput(); e != nil {
+			return nil, fmt.Errorf("移除旧 peer 失败: %v %s", e, strings.TrimSpace(string(o)))
+		}
+		removed++
+	}
+
+	log.Printf("tunnel peers: %s 更新 %d 个，移除 %d 个", name, len(wantSet), removed)
+	return map[string]interface{}{"peers": len(wantSet), "removed": removed}, nil
+}
+
 func serve() {
 	mux := http.NewServeMux()
 
@@ -287,6 +434,20 @@ func serve() {
 			return
 		}
 		writeJSON(w, 200, map[string]interface{}{"ok": true, "name": req.Name})
+	})
+
+	mux.HandleFunc("/tunnel/peer", func(w http.ResponseWriter, r *http.Request) {
+		var req peerReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad_request: " + err.Error()})
+			return
+		}
+		stat, err := tunnelSetPeers(req.Name, req.Conf)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{"ok": true, "name": req.Name, "stat": stat})
 	})
 
 	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {

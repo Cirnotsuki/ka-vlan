@@ -4,7 +4,7 @@
             <!-- 左栏 -->
             <div class="panel" v-if="mode !== 'join'">
                 <!-- Join 表单（serve 模式时隐藏） -->
-                <div v-if="mode !== 'serve'" class="col grow">
+                <div v-if="mode === 'idle'" class="col grow">
                     <h2>加入服务器</h2>
                     <el-form label-position="top" :disabled="mode === 'joining'">
                         <el-form-item label="昵称（留空 = 匿名）">
@@ -36,6 +36,17 @@
                     <el-button type="primary" @click="doJoin" v-if="mode !== 'joining'">加入服务器</el-button>
                 </div>
 
+                <!-- Join 状态面板 -->
+                <div v-if="mode === 'starting'" class="col grow">
+                    <h2>连接中</h2>
+
+                    <div class="card">
+                        <div class="kv">
+                            <span>正在启动服务器 {{ ip || "..." }}</span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Hub 管理列表（serve 模式显示） -->
                 <div v-if="mode === 'serve'" class="col grow">
                     <h2>{{ networkName }} · 成员管理（注册服务端口 :{{ serverPort }}）</h2>
@@ -46,12 +57,26 @@
                             <el-table-column label="昵称" min-width="120">
                                 <template slot-scope="scope">
                                     <el-popover trigger="hover" placement="top">
-                                        <p>公钥: {{ scope.row.public_key }}</p>
-                                        <p>IP: {{ scope.row.ip }}</p>
+                                        <el-descriptions class="margin-top" :column="1" size="small " border>
+                                            <el-descriptions-item>
+                                                <template slot="label"> 公钥: </template>
+                                                <span> {{ scope.row.public_key }}</span>
+                                            </el-descriptions-item>
+                                            <el-descriptions-item>
+                                                <template slot="label"> IP: </template>
+                                                <span> {{ scope.row.ip }}</span>
+                                            </el-descriptions-item>
+                                            <el-descriptions-item>
+                                                <template slot="label"> 上次握手时间: </template>
+                                                <span> {{ scope.row.lastConnect ? new Date() : "-" }}</span>
+                                            </el-descriptions-item>
+                                        </el-descriptions>
                                         <div slot="reference" class="name-wrapper">
-                                            <el-tag size="medium" :type="scope.row.status === 0 ? 'danger' : ''">{{
-                                                scope.row.name
-                                            }}</el-tag>
+                                            <el-tag
+                                                style="width: 100%"
+                                                :type="scope.row.status === 0 ? 'danger' : scope.row.online ? 'success' : 'info'"
+                                                >{{ scope.row.name }}</el-tag
+                                            >
                                         </div>
                                     </el-popover>
                                 </template>
@@ -59,7 +84,12 @@
 
                             <el-table-column prop="vpn_ip" label="内网 IP" min-width="120">
                                 <template slot-scope="scope">
-                                    <el-input v-model="scope.row.vpn_ip" placeholder="端口" style="width: 100%" />
+                                    <el-input
+                                        v-model="scope.row.vpn_ip"
+                                        placeholder="端口"
+                                        style="width: 100%"
+                                        @change="updateVpnIp(scope.row)"
+                                    />
                                 </template>
                             </el-table-column>
 
@@ -82,7 +112,7 @@
             <!-- 右栏 -->
             <div class="panel">
                 <!-- Start Serve 表单 -->
-                <div v-if="mode === 'serve' || mode === 'idle'" class="col grow">
+                <div v-if="mode === 'serve' || mode === 'starting' || mode === 'idle'" class="col grow">
                     <h2>开启服务</h2>
                     <!-- <span class="spacer"></span> -->
 
@@ -116,7 +146,7 @@
                         </el-form-item>
                     </el-form>
 
-                    <el-button type="success" @click="doStartServe" v-if="mode !== 'serve'">开启服务</el-button>
+                    <el-button type="success" @click="doStartServe" v-if="mode !== 'serve'" :disabled="mode !== 'idle'">开启服务</el-button>
                     <el-button type="danger" @click="stopServe" v-if="mode === 'serve'">停止服务</el-button>
                     <!-- <el-button type="primary" @click="testJoin" v-if="mode === 'serve'">测试加入</el-button> -->
 
@@ -263,6 +293,8 @@ export default {
             coreOnline: false,
             // 测试用的客户端网卡是否已装
             testTunnelUp: false,
+            // 上次灌进 WireGuard 的服务端 conf，用来判断 peers 有没有真的变（没变就不重装隧道）
+            lastServerConf: '',
         };
     },
     computed: {
@@ -298,7 +330,7 @@ export default {
     methods: {
         async init() {
             await this.$db.init();
-            const info = await Server.getInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
+            const info = await Server.getLocalInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
             this.machineGuid = ((await getMachineGuid()) || '').replace(/-/g, '');
 
             this.nickName = info.name || '';
@@ -382,20 +414,24 @@ MTU = 1280
 PostUp = iptables -A FORWARD -o wg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o wg0 -j ACCEPT`;
 
-            conf += (await this.serverInst.members()).map(
-                (u) => `
-                
+            // 注意 .join('')：直接 conf += 数组 会走 Array.toString()，每个 [Peer] 之间插一个逗号，
+            // WireGuard 解析到只有 "," 的行就报错，隧道服务注册成功后立刻退出（状态 STOPPED）
+            conf += (await this.serverInst.members())
+                .map(
+                    (u) => `
+
 [Peer]
 PublicKey = ${u.public_key}
 AllowedIPs = ${u.vpn_ip}/32`,
-            );
+                )
+                .join('\n');
 
             console.log(conf);
             return conf;
         },
 
         async buildClientConf(publicKey, vpnIp = SERVER_VPN_IP, endPoint = `${this.ip}:${this.wgPort}`) {
-            const info = await Server.getInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
+            const info = await Server.getLocalInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
             if (!info.public_key) throw new Error('服务器公钥还没生成');
             const vpnIps = vpnIp.replace(/\d+$/, '');
             const conf = `
@@ -434,11 +470,39 @@ PersistentKeepalive = 25`;
             await this.serverInst.ready;
 
             this.members = await this.serverInst.users();
+
+            const conf = await this.buildServerConf();
+            if (conf !== this.lastServerConf) {
+                await this.hotUpdateServerPeers(conf);
+            }
+        },
+
+        // 独立的热更新：不重装隧道，把当前成员表用 wg.exe set 增量同步进运行中的接口。
+        // conf 可以传进来复用（省一次 buildServerConf），不传就自己算。
+        async hotUpdateServerPeers(conf) {
+            if (!this.serverInst) return;
+            await this.serverInst.ready;
+            if (!this.tunnelUp) return { peers: 0, removed: 0 };
+
+            const body = conf || (await this.buildServerConf());
+            const res = await fetch(`${this.$api}/tunnel/peer`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: this.networkName, conf: body }),
+            });
+            const result = await res.json();
+            if (!res.ok || result.error) {
+                throw new Error(result.error || `peer 热更新失败（HTTP ${res.status}）`);
+            }
+
+            this.lastServerConf = body;
+            return result.stat || { peers: 0, removed: 0 };
         },
 
         async doStartServe() {
             const serverPort = parseInt(this.serverPort, 10) || DEFAULT_WG_PORT;
             try {
+                this.mode = 'starting';
                 // 1) Node 侧先把注册服务立起来（成员表落在 sqlite）
                 if (!this.serverInst) {
                     this.serverInst = new Server(this.$db, serverPort);
@@ -448,6 +512,7 @@ PersistentKeepalive = 25`;
                 // 2) 再装虚拟网卡
                 const conf = await this.buildServerConf();
                 await this.startTunnel(this.networkName, conf);
+                this.lastServerConf = conf;
                 this.tunnelUp = true;
                 this.serveKey = (this.serverInst.self && this.serverInst.self.public_key) || '';
                 this.serverInst.onConnect = this.onConnect;
@@ -457,6 +522,7 @@ PersistentKeepalive = 25`;
 
                 this.serverState = this.serverInst.state || '注册服务已就绪';
             } catch (e) {
+                this.mode = 'idle';
                 this.$message.error(this.translateErr(e.message));
             }
             this.pollState();
@@ -473,6 +539,7 @@ PersistentKeepalive = 25`;
                 // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
                 await this.stopTunnel(this.networkName);
                 this.tunnelUp = false;
+                this.lastServerConf = ''; // 下次开启时一定要重新灌一遍
             } catch (e) {
                 this.$message.error(this.translateErr(e.message));
             }
@@ -497,11 +564,11 @@ PersistentKeepalive = 25`;
 
             const serverPort = parseInt(this.serverPort, 10) || 1212;
             try {
-                const info = await Server.updateInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
+                const info = await Server.updateLocalInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
                 // const res = await this.post('/api/join', {
                 //     nickName: this.nickName, publicKey: info.public_key, guid: this.machineGuid,
                 // });
-                // await Server.updateInfo(this.$db, this.nickName || '', res.server, `${this.ip}:${serverPort}`);
+                // await Server.updateLocalInfo(this.$db, this.nickName || '', res.server, `${this.ip}:${serverPort}`);
                 // this.wgPort = res.port;
                 const conf = await this.buildClientConf(info.public_key, `${VPN_PREFIX}2`, `${this.ip}:${this.wgPort}`);
 
@@ -561,6 +628,15 @@ PersistentKeepalive = 25`;
                 throw new Error(result.error || `关闭隧道失败（HTTP ${res.status}）`);
             }
             return result;
+        },
+
+        async updateVpnIp(row) {
+            if (!this.serverInst) return;
+            await this.serverInst.ready;
+
+            await this.serverInst.updateUserVpnIp(row.vpn_ip, row.id);
+            this.refreshMenbers();
+            this.pollState();
         },
 
         async resume(row) {
