@@ -53,6 +53,8 @@ export default class Server {
         await this._ensureSelf();
         await this._ensureVpnIpUnique();
         await this._listen();
+        // 注意：IPv4 转发不能在这里开 —— 此刻虚拟网卡还没装，地址不存在，PowerShell 会直接抛错。
+        // 交给调用方在 startTunnel 成功之后调 enableForwarding（接口每次重建都要重开）。
         this.banUsers = await this._getBanUsers();
         this.startedAt = Date.now();
         // 唯一索引建失败时 _ensureVpnIpUnique 已经写过原因，别覆盖掉

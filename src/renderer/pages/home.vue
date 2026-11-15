@@ -215,7 +215,7 @@
                         </div>
 
                         <div class="kv">
-                            <el-descriptions class="margin-top" :column="3" size="mini" style="width: 100%;" border>
+                            <el-descriptions class="margin-top" :column="3" size="mini" style="width: 100%" border>
                                 <template v-for="(user, index) in peers">
                                     <el-descriptions-item :key="'name-' + index">
                                         <template slot="label">昵称</template>
@@ -266,7 +266,7 @@
 <script>
 import './home.less';
 import Server from '../utils/server';
-import { getMachineGuid, formatDate } from '../utils/helper';
+import { getMachineGuid, formatDate, enableForwarding } from '../utils/helper';
 // 对应 ui/index.html 的 Vue 页面版：
 // 状态全部走 vlancore 的 127.0.0.1:7400 HTTP API
 import {
@@ -336,6 +336,8 @@ export default {
             testTunnelUp: false,
             // 上次灌进 WireGuard 的服务端 conf，用来判断 peers 有没有真的变（没变就不重装隧道）
             lastTunnelConf: '',
+            // 开转发失败的原因（接口每次重建都要重开，失败不阻断服务）
+            forwardError: '',
         };
     },
     computed: {
@@ -612,13 +614,23 @@ PersistentKeepalive = 25`;
                 const conf = await this.buildServerConf();
                 await this.startTunnel(this.networkName, conf);
                 this.tunnelUp = true;
+
+                // 3) 隧道起来之后才开 IPv4 转发：接口是刚建的，forwarding 属性跟着接口走，
+                //    每次重装都要重开；失败只提示，不阻断服务
+                this.forwardError = '';
+                try {
+                    await enableForwarding(this.serverInst.self ? this.serverInst.self.vpn_ip : this.vpnIp);
+                } catch (fe) {
+                    this.forwardError = `IPv4 转发未开启：${this.translateErr(fe.message)}`;
+                    this.$message.warning('IPv4 转发未开启，成员之间可能不通');
+                }
                 this.serverKey = (this.serverInst.self && this.serverInst.self.public_key) || '';
                 this.serverInst.onConnect = this.onConnect;
                 await this.refreshMenbers();
 
                 this.mode = 'serve';
 
-                this.serverState = this.serverInst.state || '注册服务已就绪';
+                this.serverState = [this.forwardError, this.serverInst.state].filter(Boolean).join('\n') || '注册服务已就绪';
             } catch (e) {
                 if (this.tunnelUp) {
                     // 隧道已经装上了，只是后面的成员同步失败：

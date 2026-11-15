@@ -112,10 +112,12 @@ export function send(res, code, payload) {
     });
     res.end(body);
 }
-export function enableForwarding() {
+export function enableForwarding(serverVpnIp = SERVER_VPN_IP) {
     return new Promise((resolve, reject) => {
-        const script = `
-            $interface = Get-NetIPAddress -IPAddress '${SERVER_VPN_IP}' -AddressFamily IPv4 -ErrorAction Stop
+        const script = /* powershell */`
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            $OutputEncoding = [System.Text.Encoding]::UTF8
+            $interface = Get-NetIPAddress -IPAddress '${serverVpnIp}' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
             Set-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 -Forwarding Enabled -ErrorAction Stop
             $result = Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4
             if ($result.Forwarding -ne 'Enabled') { throw 'IPv4 forwarding verification failed.' }
@@ -142,9 +144,20 @@ export function enableForwarding() {
         child.once('close', (code) => {
             if (code === 0) {
                 resolve(true);
-            } else {
-                reject(new Error(errorOutput || output || `PowerShell exit code: ${code}`));
+                return;
             }
+
+            // PowerShell 的报错里第一行才有用，后面全是 CIM 查询细节
+            const raw = (errorOutput || output || '').trim();
+            let detail = (raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)[0] || '')
+                .replace(/^Get-NetIPAddress\s*:\s*/i, '');
+
+            if (/CIM/i.test(detail)) detail = detail.split(/CIM/i)[0].trim();
+            detail = detail.replace(/\s+/g, ' ').slice(0, 120);
+
+            reject(new Error(
+                `找不到地址 ${serverVpnIp} 对应的网卡（隧道可能还没装好）${detail ? `：${detail}` : `（PowerShell 退出码 ${code}）`}`,
+            ));
         });
     });
 }
