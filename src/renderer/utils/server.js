@@ -163,8 +163,12 @@ SELECT changes() AS changes;`);
         }
 
         try {
-            if (url.pathname === '/api/state' && req.method === 'GET') {
-                send(res, 200, await this.getState(await readBody(req)));
+            if (url.pathname === '/api/state') {
+                // GET 带 ?publicKey= 也能用：主进程轮询是无 body 的 GET
+                const body = await readBody(req).catch(() => ({}));
+                const publicKey = body.publicKey || url.searchParams.get('publicKey') || '';
+
+                send(res, 200, await this.getState({ ...body, publicKey }));
                 return;
             }
             if (url.pathname === '/api/join' && req.method === 'POST') {
@@ -194,14 +198,14 @@ SELECT changes() AS changes;`);
             joinErr = '此设备已被封禁';
         }
 
-        const info = members.filter((u) => u.public_key === publicKey);
+        const me = members.find((u) => u.public_key === publicKey) || {};
 
         return {
             joinErr,
             wgPort: this.wgPort,
-            vpnIp: info.vpn_ip,
+            vpnIp: me.vpn_ip || '',
             serverKey: this.self ? this.self.public_key : '',
-            peers: members.map(this._toMember),
+            peers: members.map((u) => this._toMember(u)),
         };
     }
 

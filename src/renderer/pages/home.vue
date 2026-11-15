@@ -438,8 +438,9 @@ export default {
                 /* 关窗路径不弹窗 */
             }
         },
-        async post(path, body) {
-            const res = await fetch(this.$api + path, {
+        // base 省略时打本机核心（7400）；访问远端服务器要显式传 base
+        async post(path, body, base) {
+            const res = await fetch((base || this.$api) + path, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body || {}),
@@ -538,23 +539,28 @@ PersistentKeepalive = 25`;
 
             if (payload.empty) return; // 长轮询心跳，没有变化
 
-            const stat = payload.data || {};
-            const startAt = +payload.startAt;
-            const at = +payload.at;
+            try {
+                const stat = payload.data || {};
+                const startAt = +payload.startAt;
+                const at = +payload.at;
 
-            this.joinErr = stat.joinErr || '';
-            if (stat.wgPort) this.wgPort = stat.wgPort;
-            if (stat.vpnIp) this.vpnIp = stat.vpnIp;
-            if (stat.serverKey) this.serverKey = stat.serverKey;
-            if (Array.isArray(stat.peers)) {
-                this.memberCount = stat.peers.length;
-                this.peers = stat.peers;
-            }
-            this.latencyMs = at - startAt;
+                this.joinErr = stat.joinErr || '';
+                if (stat.wgPort) this.wgPort = stat.wgPort;
+                if (stat.vpnIp) this.vpnIp = stat.vpnIp;
+                if (stat.serverKey) this.serverKey = stat.serverKey;
+                if (Array.isArray(stat.peers)) {
+                    this.memberCount = stat.peers.length; // peers 包含自己的
+                    this.peers = stat.peers;
+                }
+                if (Number.isFinite(startAt) && Number.isFinite(at)) this.latencyMs = at - startAt;
 
-            const conf = await this.buildClientConf();
-            if (conf !== this.lastTunnelConf) {
-                await this.hotUpdateServerPeers(conf);
+                const conf = await this.buildClientConf();
+                if (conf !== this.lastTunnelConf) {
+                    await this.hotUpdateServerPeers(conf);
+                }
+            } catch (e) {
+                // 这里抛出去会变成 unhandledrejection（IPC 回调没人 await）
+                this.joinErr = this.translateErr(e.message);
             }
         },
         async refreshMenbers() {
@@ -573,25 +579,22 @@ PersistentKeepalive = 25`;
             await this.refreshMenbers();
         },
 
-        // 独立的热更新：不重装隧道，把当前成员表用 wg.exe set 增量同步进运行中的接口。
-        // conf 可以传进来复用（省一次 buildServerConf），不传就自己算。
+        // 独立的热更新：不重装隧道，把 conf 里的 [Peer] 增量同步进运行中的接口。
+        // 服务端传 buildServerConf 的结果，客户端传 buildClientConf 的结果；不传就按当前模式算。
         async hotUpdateServerPeers(conf) {
-            if (!this.serverInst) return;
-            await this.serverInst.ready;
             if (!this.tunnelUp) return { peers: 0, removed: 0 };
 
-            const body = conf || (await this.buildServerConf());
             const res = await fetch(`${this.$api}/tunnel/peer`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: this.networkName, conf: body }),
+                body: JSON.stringify({ name: this.networkName, conf }),
             });
             const result = await res.json();
             if (!res.ok || result.error) {
                 throw new Error(result.error || `peer 热更新失败（HTTP ${res.status}）`);
             }
 
-            this.lastTunnelConf = body;
+            this.lastTunnelConf = conf;
             return result.stat || { peers: 0, removed: 0 };
         },
 
@@ -660,11 +663,12 @@ PersistentKeepalive = 25`;
             const serverPort = parseInt(this.serverPort, 10) || 1212;
             try {
                 const info = await Server.updateLocalInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
+                // 注意 base：/api/join 在远端服务器上，不是本机 7400 核心
                 const res = await this.post('/api/join', {
                     nickName: this.nickName,
                     publicKey: info.public_key,
                     guid: this.machineGuid,
-                });
+                }, `http://${this.ip}:${serverPort}`);
 
                 this.vpnIp = res.vpnIp;
                 this.serverKey = res.serverKey;
@@ -689,8 +693,9 @@ PersistentKeepalive = 25`;
                 this.mode = 'join';
 
                 // 加入成功：把真实的 /api/state 地址交给主进程去轮询（4 秒一轮，长轮询）
+                // 带上 publicKey：服务端要按它算"我是谁"、返回我的 vpn_ip
                 ipcRenderer.send('poll:state:start', {
-                    url: `http://${this.ip}:${serverPort}/api/state`,
+                    url: `http://${this.ip}:${serverPort}/api/state?publicKey=${encodeURIComponent(info.public_key)}`,
                     intervalMs: 4000,
                     longPoll: true,
                 });
@@ -777,8 +782,12 @@ PersistentKeepalive = 25`;
             if (!this.serverInst) return;
             await this.serverInst.ready;
 
-            await this.serverInst.updateUserVpnIp(row.vpn_ip, row.id);
-            this.refreshMenbers();
+            try {
+                await this.serverInst.updateUserVpnIp(row.vpn_ip, row.id);
+                await this.refreshMenbers();
+            } catch (e) {
+                this.$message.error(this.translateErr(e.message));
+            }
             this.pollState();
         },
 
@@ -786,8 +795,12 @@ PersistentKeepalive = 25`;
             if (!this.serverInst) return;
             await this.serverInst.ready;
 
-            this.serverInst.resume(row.public_key);
-            this.refreshMenbers();
+            try {
+                await this.serverInst.resume(row.public_key);
+                await this.refreshMenbers();
+            } catch (e) {
+                this.$message.error(this.translateErr(e.message));
+            }
             this.pollState();
         },
 
@@ -795,8 +808,12 @@ PersistentKeepalive = 25`;
             if (!this.serverInst) return;
             await this.serverInst.ready;
 
-            this.serverInst.ban(row.public_key);
-            this.refreshMenbers();
+            try {
+                await this.serverInst.ban(row.public_key);
+                await this.refreshMenbers();
+            } catch (e) {
+                this.$message.error(this.translateErr(e.message));
+            }
             this.pollState();
         },
         async remove(row) {
@@ -809,8 +826,12 @@ PersistentKeepalive = 25`;
                 return; // 用户取消
             }
 
-            this.serverInst.remove(row.public_key);
-            this.refreshMenbers();
+            try {
+                await this.serverInst.remove(row.public_key);
+                await this.refreshMenbers();
+            } catch (e) {
+                this.$message.error(this.translateErr(e.message));
+            }
             this.pollState();
         },
 
