@@ -13,6 +13,7 @@ import http from 'http';
 import fs from 'fs'; //  clipboard, screen, desktopCapturer,
 import IpcScreenshot from './ipcScreenshot';
 import IpcManager from './ipcManager';
+import Poller from './poller';
 
 /**
  * Set `__static` path to static files in production
@@ -228,10 +229,10 @@ const winURL = process.env.NODE_ENV === 'development' ? 'http://localhost:9080/'
 function createWindow() {
     shellLog('createWindow: 创建主窗口');
     mainWindow = new BrowserWindow({
-        width: 1100,
-        height: 650,
-        minWidth: 400,
-        minHeight: 400,
+        width: 1024,
+        height: 768,
+        minWidth: 1024,
+        minHeight: 768,
         center: true,
         backgroundColor: '#f3f5f7',
         title: 'Vlan 组网',
@@ -255,6 +256,22 @@ function createWindow() {
     mainWindow.removeMenu();
     mainWindow.webContents.closeDevTools();
 }
+
+// —— 轮询在主进程：渲染层只负责起停和收结果 ——
+// 都用 setTimeout 串行，上一轮有结果才排下一轮，不会像 setInterval 那样在慢网络下堆请求
+const poller = new Poller(() => mainWindow);
+
+ipcMain.on('poll:core:start', (e, opts) => poller.startCore(opts || {}));
+ipcMain.on('poll:core:stop', () => poller.stopCore());
+
+ipcMain.on('poll:state:start', (e, opts) => {
+    shellLog(`poll:state 启动 ${(opts && opts.url) || '(空)'}`);
+    poller.startState(opts || {});
+});
+ipcMain.on('poll:state:stop', () => {
+    shellLog('poll:state 停止');
+    poller.stopState();
+});
 
 // 限制单实例应用（必须在 userData 初始化之后：单例锁就存在 userData 目录里）
 const curInstance = app.requestSingleInstanceLock();
@@ -300,6 +317,7 @@ if (!curInstance) {
 
 app.on('window-all-closed', async () => {
     shellLog('window-all-closed: 停核心');
+    if (poller) poller.dispose();
     await stopCore();
     if (process.platform !== 'darwin') {
         app.quit();

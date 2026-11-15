@@ -4,7 +4,7 @@
             <!-- 左栏 -->
             <div class="panel" v-if="mode !== 'join'">
                 <!-- Join 表单（serve 模式时隐藏） -->
-                <div v-if="mode === 'idle'" class="col grow">
+                <div v-if="mode === 'idle' || mode === 'joining'" class="col grow">
                     <h2>加入服务器</h2>
                     <el-form label-position="top" :disabled="mode === 'joining'">
                         <el-form-item label="昵称（留空 = 匿名）">
@@ -33,7 +33,7 @@
                             </div>
                         </el-form-item>
                     </el-form>
-                    <el-button type="primary" @click="doJoin" v-if="mode !== 'joining'">加入服务器</el-button>
+                    <el-button type="primary" @click="doJoin" :disabled="mode === 'joining'">加入服务器</el-button>
                 </div>
 
                 <!-- Join 状态面板 -->
@@ -42,7 +42,7 @@
 
                     <div class="card">
                         <div class="kv">
-                            <span>正在启动服务器 {{ ip || "..." }}</span>
+                            <span>正在启动服务器, 监听端口: {{ wgPort }}</span>
                         </div>
                     </div>
                 </div>
@@ -135,7 +135,7 @@
                                 clearable
                             />
                         </el-form-item>
-                        <el-form-item label="服务端口号">
+                        <el-form-item label="注册端口号">
                             <el-input
                                 v-model="serverPort"
                                 placeholder="请输入端口"
@@ -188,7 +188,7 @@
 
                         <div class="kv">
                             <span>服务器公钥</span>
-                            <span>{{ serveKey || "-" }}</span>
+                            <span>{{ serverKey || "-" }}</span>
                         </div>
 
                         <div class="kv">
@@ -212,6 +212,29 @@
                         <div class="kv">
                             <span>成员数</span>
                             <span>{{ memberCount || "-" }}</span>
+                        </div>
+
+                        <div class="kv">
+                            <el-descriptions class="margin-top" :column="3" size="mini" style="width: 100%;" border>
+                                <template v-for="(user, index) in peers">
+                                    <el-descriptions-item :key="'name-' + index">
+                                        <template slot="label">昵称</template>
+                                        <span> {{ user.name }}</span>
+                                    </el-descriptions-item>
+                                    <el-descriptions-item :key="'last-' + index">
+                                        <template slot="label"> 上次握手时间</template>
+                                        <span>
+                                            {{
+                                                user.lastConnect ? formatDate(new Date(user.lastConnect), "yyyy年MM月dd日 HH:mm:ss") : "-"
+                                            }}</span
+                                        >
+                                    </el-descriptions-item>
+                                    <el-descriptions-item :key="'online-' + index">
+                                        <template slot="label">在线</template>
+                                        <el-tag :type="user.online ? 'success' : 'danger'">{{ user.online ? "是" : "否" }}</el-tag>
+                                    </el-descriptions-item>
+                                </template>
+                            </el-descriptions>
                         </div>
 
                         <div class="kv">
@@ -243,13 +266,29 @@
 <script>
 import './home.less';
 import Server from '../utils/server';
-import { getMachineGuid } from '../utils/helper';
+import { getMachineGuid, formatDate } from '../utils/helper';
 // 对应 ui/index.html 的 Vue 页面版：
 // 状态全部走 vlancore 的 127.0.0.1:7400 HTTP API
 import {
-    DEFAULT_WG_PORT, DEFAULT_SERVER_PORT, SERVER_VPN_IP, NETWORK_NAME, VPN_PREFIX,
+    DEFAULT_WG_PORT, DEFAULT_SERVER_PORT, SERVER_VPN_IP, NETWORK_NAME, LOCAL_NAME,
 } from '../constants';
 
+// 轮询在主进程里跑，这里只通过 ipc 起停 + 收结果（nodeIntegration 开着，可直接 require）
+const { ipcRenderer } = require('electron');
+
+// const res = {
+//     vpnIp: '',
+//     wgPort: '',
+//     serverKey: '',
+//     peers: [
+//         {
+//             id: 0,
+//             name: '匿名',
+//             lastConnect: 0,
+//             online: false,
+//         },
+//     ],
+// };
 // 虚拟网卡（WireGuard 隧道服务）名字：只在这个页面定义。
 // conf 文件名就是它，系统服务名是 WireGuardTunnel$<这个值>，改动时服务端/客户端要一致。
 
@@ -265,20 +304,22 @@ export default {
             // 服务器 IP 拆成 4 段，最后用点拼起来（见 computed.ip）
             ipParts: ['', '', '', ''],
             vpnIp: SERVER_VPN_IP,
-            serveKey: '',
+            serverKey: '',
             serverPort: `${DEFAULT_SERVER_PORT}`,
             wgPort: `${DEFAULT_WG_PORT}`,
             networkName: NETWORK_NAME,
             members: [],
 
             memberCount: 0,
+            // 加入服务器后的节点状态（主进程轮询 /api/state 推送）
+            peers: [],
+
             portOK: false,
             latencyMs: 0,
 
             selfPublicKey: '',
             selfPrivateKey: '',
 
-            st: {},
             joinErr: '',
             statusMsg: '',
             serverState: '',
@@ -289,12 +330,12 @@ export default {
             serverInst: null,
             // 当前虚拟网卡是否已装（关窗兜底只看这个）
             tunnelUp: false,
-            // 核心（vlancore:7400）连通性，pollState 每 2 秒刷一次
+            // 核心（vlancore:7400）连通性，由主进程轮询后推送
             coreOnline: false,
             // 测试用的客户端网卡是否已装
             testTunnelUp: false,
             // 上次灌进 WireGuard 的服务端 conf，用来判断 peers 有没有真的变（没变就不重装隧道）
-            lastServerConf: '',
+            lastTunnelConf: '',
         };
     },
     computed: {
@@ -317,20 +358,29 @@ export default {
         },
     },
     mounted() {
-        this.pollState();
         this.init();
-        this.timer = setInterval(() => this.pollState(), 2000);
+        this.pollState();
+
+        // 轮询全部搬去主进程：这里只挂接收器，主进程用 webContents.send 推结果回来
+        ipcRenderer.on('poll:core', this.onCoreStatus);
+        ipcRenderer.on('poll:state', this.onNodeState);
+        ipcRenderer.send('poll:core:start', { url: this.$api, intervalMs: 2000 });
+
         // 关窗/刷新的兜底：页面卸载前把虚拟网卡卸掉
         window.addEventListener('beforeunload', this.onWindowClose);
     },
     beforeDestroy() {
-        clearInterval(this.timer);
+        ipcRenderer.removeListener('poll:core', this.onCoreStatus);
+        ipcRenderer.removeListener('poll:state', this.onNodeState);
+        ipcRenderer.send('poll:core:stop');
+        ipcRenderer.send('poll:state:stop');
+
         window.removeEventListener('beforeunload', this.onWindowClose);
     },
     methods: {
         async init() {
             await this.$db.init();
-            const info = await Server.getLocalInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
+            const info = await Server.getLocalInfo(this.$db, LOCAL_NAME, SERVER_VPN_IP, '');
             this.machineGuid = ((await getMachineGuid()) || '').replace(/-/g, '');
 
             this.nickName = info.name || '';
@@ -342,6 +392,8 @@ export default {
             this.selfPublicKey = info.public_key || '';
             this.selfPrivateKey = info.private_key || '';
         },
+
+        formatDate,
 
         translateErr(message) {
             if (message.includes('Failed to fetch')) {
@@ -429,21 +481,22 @@ AllowedIPs = ${u.vpn_ip}/32`,
             console.log(conf);
             return conf;
         },
-
-        async buildClientConf(publicKey, vpnIp = SERVER_VPN_IP, endPoint = `${this.ip}:${this.wgPort}`) {
+        async buildClientConf() {
             const info = await Server.getLocalInfo(this.$db, this.networkName, SERVER_VPN_IP, '');
-            if (!info.public_key) throw new Error('服务器公钥还没生成');
-            const vpnIps = vpnIp.replace(/\d+$/, '');
+            if (!info.private_key) throw new Error('客户端密钥对还没生成');
+            if (!this.serverKey) throw new Error('服务端未开启，无法连接');
+
+            const vpnIps = this.vpnIp.replace(/\d+$/, '');
             const conf = `
 [Interface]
 PrivateKey = ${info.private_key}
-Address = ${vpnIp}/24
+Address = ${this.vpnIp}/24
 MTU = 1280
 
 [Peer]
-PublicKey = ${publicKey}
+PublicKey = ${this.serverKey}
 AllowedIPs = ${vpnIps}0/24
-Endpoint = ${endPoint}
+Endpoint = ${this.ip}:${this.wgPort}
 PersistentKeepalive = 25`;
 
             console.log(conf);
@@ -461,10 +514,49 @@ PersistentKeepalive = 25`;
             if (digits !== raw) this.$set(this.ipParts, index, digits);
         },
 
-        async onConnect() {
-            await this.refreshMenbers();
+        // 主进程推来的核心连通性（原 pollState 里的 pingCore）
+        onCoreStatus(payload) {
+            const online = !!(payload && payload.online);
+            this.coreOnline = online;
+
+            if (!online) {
+                this.statusMsg = '核心未连接（界面可用）';
+                this.joinErr = '';
+            } else if (this.statusMsg === '核心未连接（界面可用）') {
+                this.statusMsg = this.serverInst ? '核心就绪' : '';
+            }
         },
 
+        // 主进程推来的节点状态（加入服务器后按 4 秒 / 长轮询拉 /api/state）
+        async onNodeState(payload) {
+            if (!payload) return;
+
+            if (!payload.ok) {
+                this.joinErr = payload.error || '获取节点状态失败';
+                return;
+            }
+
+            if (payload.empty) return; // 长轮询心跳，没有变化
+
+            const stat = payload.data || {};
+            const startAt = +payload.startAt;
+            const at = +payload.at;
+
+            this.joinErr = stat.joinErr || '';
+            if (stat.wgPort) this.wgPort = stat.wgPort;
+            if (stat.vpnIp) this.vpnIp = stat.vpnIp;
+            if (stat.serverKey) this.serverKey = stat.serverKey;
+            if (Array.isArray(stat.peers)) {
+                this.memberCount = stat.peers.length;
+                this.peers = stat.peers;
+            }
+            this.latencyMs = at - startAt;
+
+            const conf = await this.buildClientConf();
+            if (conf !== this.lastTunnelConf) {
+                await this.hotUpdateServerPeers(conf);
+            }
+        },
         async refreshMenbers() {
             if (!this.serverInst) return;
             await this.serverInst.ready;
@@ -472,9 +564,13 @@ PersistentKeepalive = 25`;
             this.members = await this.serverInst.users();
 
             const conf = await this.buildServerConf();
-            if (conf !== this.lastServerConf) {
+            if (conf !== this.lastTunnelConf) {
                 await this.hotUpdateServerPeers(conf);
             }
+        },
+
+        async onConnect() {
+            await this.refreshMenbers();
         },
 
         // 独立的热更新：不重装隧道，把当前成员表用 wg.exe set 增量同步进运行中的接口。
@@ -495,7 +591,7 @@ PersistentKeepalive = 25`;
                 throw new Error(result.error || `peer 热更新失败（HTTP ${res.status}）`);
             }
 
-            this.lastServerConf = body;
+            this.lastTunnelConf = body;
             return result.stat || { peers: 0, removed: 0 };
         },
 
@@ -512,9 +608,8 @@ PersistentKeepalive = 25`;
                 // 2) 再装虚拟网卡
                 const conf = await this.buildServerConf();
                 await this.startTunnel(this.networkName, conf);
-                this.lastServerConf = conf;
                 this.tunnelUp = true;
-                this.serveKey = (this.serverInst.self && this.serverInst.self.public_key) || '';
+                this.serverKey = (this.serverInst.self && this.serverInst.self.public_key) || '';
                 this.serverInst.onConnect = this.onConnect;
                 await this.refreshMenbers();
 
@@ -539,7 +634,6 @@ PersistentKeepalive = 25`;
                 // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
                 await this.stopTunnel(this.networkName);
                 this.tunnelUp = false;
-                this.lastServerConf = ''; // 下次开启时一定要重新灌一遍
             } catch (e) {
                 this.$message.error(this.translateErr(e.message));
             }
@@ -549,6 +643,7 @@ PersistentKeepalive = 25`;
                 this.serverInst = null;
             }
 
+            ipcRenderer.send('poll:state:stop');
             this.mode = 'idle';
             this.statusMsg = '';
             this.members = [];
@@ -565,24 +660,42 @@ PersistentKeepalive = 25`;
             const serverPort = parseInt(this.serverPort, 10) || 1212;
             try {
                 const info = await Server.updateLocalInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
-                // const res = await this.post('/api/join', {
-                //     nickName: this.nickName, publicKey: info.public_key, guid: this.machineGuid,
-                // });
-                // await Server.updateLocalInfo(this.$db, this.nickName || '', res.server, `${this.ip}:${serverPort}`);
-                // this.wgPort = res.port;
-                const conf = await this.buildClientConf(info.public_key, `${VPN_PREFIX}2`, `${this.ip}:${this.wgPort}`);
+                const res = await this.post('/api/join', {
+                    nickName: this.nickName,
+                    publicKey: info.public_key,
+                    guid: this.machineGuid,
+                });
 
+                this.vpnIp = res.vpnIp;
+                this.serverKey = res.serverKey;
+                this.wgPort = res.wgPort;
+                this.memberCount = res.peers.length;
+                this.peers = res.peers;
+
+                // this.serverKey = info.public_key;
+                // this.peers = await Server.testPeer(this.$db);
+
+                await Server.updateLocalInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
+
+                const conf = await this.buildClientConf();
                 await this.startTunnel(this.networkName, conf);
                 this.tunnelUp = true;
 
-                // if (res.error) {
-                //     this.$message.error(res.error);
-                //     this.mode = 'idle';
-                //     return;
-                // }
+                if (res.error) {
+                    this.$message.error(res.error);
+                    this.mode = 'idle';
+                    return;
+                }
                 this.mode = 'join';
+
+                // 加入成功：把真实的 /api/state 地址交给主进程去轮询（4 秒一轮，长轮询）
+                ipcRenderer.send('poll:state:start', {
+                    url: `http://${this.ip}:${serverPort}/api/state`,
+                    intervalMs: 4000,
+                    longPoll: true,
+                });
             } catch (e) {
-                this.$message.error(`核心未就绪：${this.translateErr(e.message)}`);
+                this.$message.error(this.translateErr(e.message));
                 this.mode = 'idle';
                 console.error(e);
             }
@@ -597,6 +710,11 @@ PersistentKeepalive = 25`;
             } catch (e) {
                 this.$message.error(this.translateErr(e.message));
             }
+
+            // 走人了就别再轮询那台服务器的状态
+            ipcRenderer.send('poll:state:stop');
+            this.peers = [];
+            this.memberCount = null;
             this.mode = 'idle';
 
             this.pollState();
@@ -604,7 +722,28 @@ PersistentKeepalive = 25`;
 
         // —— 虚拟网卡：起/停都委托给 vlancore（127.0.0.1:7400）——
         // 它只认两件事：给一段 wg.conf 就 /installtunnelservice，给个名字就 /uninstalltunnelservice。
+        // 装之前先自检：WireGuard 配置写错时只会表现为"服务没跑起来"，错误信息一点用都没有
+        assertConf(conf) {
+            const text = String(conf || '');
+
+            if (!/^\s*\[Interface\]/m.test(text)) throw new Error('conf 缺少 [Interface] 段');
+            if (!/^\s*PrivateKey\s*=\s*\S+/m.test(text)) throw new Error('conf 缺少 PrivateKey（或为空）');
+
+            const blocks = text.split(/\[Peer\]/i).slice(1);
+            blocks.forEach((block, i) => {
+                const pk = (block.match(/^\s*PublicKey\s*=\s*(\S*)\s*$/im) || [])[1];
+                if (!pk) throw new Error(`第 ${i + 1} 个 [Peer] 的 PublicKey 为空`);
+
+                const ep = (block.match(/^\s*Endpoint\s*=\s*(.+)$/im) || [])[1];
+                if (ep && !/^[^\s:]+:\d+$/.test(ep.trim())) {
+                    throw new Error(`第 ${i + 1} 个 [Peer] 的 Endpoint 格式不对：${ep.trim()}（应为 host:port，不能有空格）`);
+                }
+            });
+        },
+
         async startTunnel(name, conf) {
+            this.assertConf(conf);
+
             const res = await fetch(`${this.$api}/tunnel/up`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -614,10 +753,14 @@ PersistentKeepalive = 25`;
             if (!res.ok || result.error) {
                 throw new Error(result.error || `启动隧道失败（HTTP ${res.status}）`);
             }
+
+            this.lastTunnelConf = conf;
             return result;
         },
 
         async stopTunnel(name) {
+            this.lastTunnelConf = '';
+
             const res = await fetch(`${this.$api}/tunnel/down`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -671,48 +814,16 @@ PersistentKeepalive = 25`;
             this.pollState();
         },
 
-        // 只测连通性：/ping 有响应 = 核心在线；成员表顺带从 serverInst 刷（没有就保持不动）
+        // 本地刷一次（Serve 模式下成员表在 serverInst 里，不走 HTTP）
         async pollState() {
-            this.coreOnline = await this.pingCore();
-
-            if (!this.coreOnline) {
-                this.st = {};
-                this.members = [];
-                this.statusMsg = '核心未连接（界面可用）';
-                this.joinErr = '';
-                return;
-            }
-
-            if (this.serverInst) {
-                try {
-                    const s = await this.serverInst.getState();
-                    this.st = s;
-                    this.members = s.members || [];
-                    this.statusMsg = s.statusMsg || '核心就绪';
-                    return;
-                } catch (e) {
-                    // 注册服务自身出错也不能把核心判成离线
-                }
-            }
-
-            if (!this.statusMsg) this.statusMsg = '核心就绪';
-        },
-
-        // 1.5 秒没响应就当离线，免得 2 秒一轮的轮询互相叠住
-        async pingCore() {
-            const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-            const timer = ctrl ? setTimeout(() => ctrl.abort(), 1500) : null;
+            if (!this.serverInst) return;
 
             try {
-                const res = await fetch(`${this.$api}/ping`, {
-                    cache: 'no-store',
-                    signal: ctrl ? ctrl.signal : undefined,
-                });
-                return res.ok;
+                const stat = await this.serverInst.getState();
+                this.members = stat.members || [];
+                this.statusMsg = stat.statusMsg || '核心就绪';
             } catch (e) {
-                return false;
-            } finally {
-                if (timer) clearTimeout(timer);
+                // 注册服务自身出错不影响核心判定
             }
         },
     },

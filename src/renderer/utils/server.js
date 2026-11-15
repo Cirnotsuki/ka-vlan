@@ -198,11 +198,10 @@ SELECT changes() AS changes;`);
 
         return {
             joinErr,
-            port: this.wgPort,
+            wgPort: this.wgPort,
             vpnIp: info.vpn_ip,
-            publicKey: this.self ? this.self.public_key : '',
+            serverKey: this.self ? this.self.public_key : '',
             peers: members.map(this._toMember),
-            uptimeMs: this.startedAt ? Date.now() - this.startedAt : 0,
         };
     }
 
@@ -340,6 +339,29 @@ SELECT changes() AS changes;`);
         };
     }
 
+    /**
+     * 测试对等连接的静态异步方法
+     * 从数据库中获取所有状态正常的用户信息，并映射为指定格式的对等节点信息
+     * @returns {Array} 返回包含对等节点信息的数组，每个节点包含id、名称、最后连接时间和在线状态
+     */
+    static async testPeer(db) {
+        // 从数据库查询所有状态为正常的用户，排除本地用户
+        const peers = await db.all(
+            `SELECT id, name, public_key, vpn_ip, ip, status FROM users
+            WHERE status = ${ST_NORMAL} AND id <> ${LOCAL_ID};`,
+        );
+
+        // 将查询结果映射为指定格式的对象数组
+        return peers.map((u) => ({
+            id: u.id, // 用户ID
+            name: u.name, // 用户名称
+            // 随机生成一个过去30天内的最后连接时间
+            lastConnect: +new Date() - Math.random() * 1000 * 60 * 60 * 24 * 30,
+            // 假设ID大于2的用户为在线状态
+            online: u.id > 2,
+        }));
+    }
+
     async members() {
         const rows = await this.db.all(
             `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
@@ -353,7 +375,7 @@ SELECT changes() AS changes;`);
             `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
             WHERE status IN (${ST_BANNED}, ${ST_NORMAL}) AND id <> ${LOCAL_ID} ORDER BY id ASC`,
         );
-        return rows.map(u => ({
+        return rows.map((u) => ({
             ...u,
             ...this._toMember(u),
         }));

@@ -27,6 +27,7 @@ body {
         height: 100vh;
         padding: 12px;
         gap: 10px;
+        justify-content: center;
         box-sizing: border-box;
 
         .panel {
@@ -40,6 +41,7 @@ body {
             flex-direction: column;
             gap: 10px;
             overflow: auto;
+            max-width: 600px;
 
             .spacer {
                 flex: 1;
@@ -89,6 +91,15 @@ body {
                             &:first-child {
                                 color: var(--dim);
                             }
+                        }
+
+                        th {
+                            font-weight: bold;
+
+                        }
+
+                        th, td {
+                            text-align: center;
                         }
 
                         .ok {
