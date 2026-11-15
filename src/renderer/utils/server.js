@@ -43,6 +43,7 @@ export default class Server {
         this.ready = this.start();
         this.state = '';
         this.userStat = new Map();
+        this.banUsers = [];
     }
 
     // —— 生命周期 ——
@@ -50,6 +51,7 @@ export default class Server {
         await this.db.init();
         await this._ensureSelf();
         await this._listen();
+        this.banUsers = await this._getBanUsers();
         this.startedAt = Date.now();
         this.state = `注册服务已监听:${this.serverPort}\n服务器公钥:${this.self.public_key}`;
         return this;
@@ -131,6 +133,18 @@ SELECT changes() AS changes;`);
         };
     }
 
+    async _getBanUsers() {
+        const banUsers = await this.db.all(
+            `SELECT  public_key, ip, guid FROM users
+              WHERE status = ${ST_BANNED} AND id <> ${LOCAL_ID};`,
+        );
+        return banUsers.map((user) => ({
+            ip: user.ip,
+            publicKey: user.public_key,
+            guid: user.guid,
+        }));
+    }
+
     // —— 路由 ——
     async _handle(req, res) {
         const url = new URL(req.url, 'http://127.0.0.1');
@@ -141,38 +155,12 @@ SELECT changes() AS changes;`);
         }
 
         try {
-            if (url.pathname === '/api/heart-beat') {
-                send(res, 200, await readBody(req), req);
-                return;
-            }
             if (url.pathname === '/api/state' && req.method === 'GET') {
                 send(res, 200, await this.getState(await readBody(req)));
                 return;
             }
             if (url.pathname === '/api/join' && req.method === 'POST') {
-                send(res, 200, await this.onRegist(await readBody(req), req));
-                return;
-            }
-            if (url.pathname === '/api/ban' && req.method === 'POST') {
-                const body = await readBody(req);
-                const ok = await this.ban(body.id !== undefined ? body.id : body.publicKey || body.public_key);
-                send(res, 200, { ok: ok ? '1' : '', error: ok ? '' : '成员不存在' });
-                return;
-            }
-            if (url.pathname === '/api/delete' && req.method === 'POST') {
-                const body = await readBody(req);
-                const ok = await this.remove(body.id !== undefined ? body.id : body.publicKey || body.public_key);
-                send(res, 200, { ok: ok ? '1' : '', error: ok ? '' : '成员不存在' });
-                return;
-            }
-            if (url.pathname === '/api/stop-serve' && req.method === 'POST') {
-                send(res, 200, { ok: '1' });
-                setTimeout(() => this.stop().catch(() => {}), 50);
-                return;
-            }
-            if (url.pathname === '/api/shutdown' && req.method === 'POST') {
-                send(res, 200, { ok: '1' });
-                setTimeout(() => this.stop().catch(() => {}), 50);
+                send(res, 200, await this.onJoin(await readBody(req), req));
                 return;
             }
 
@@ -183,50 +171,35 @@ SELECT changes() AS changes;`);
         }
     }
 
-    // —— Start Server 后 UI 轮询用 ——
-    async getState() {
+    // Client 轮询用
+    async getState(body) {
+        const { publicKey = '' } = body;
+        if (!isPublicKey(publicKey)) {
+            throw Object.assign(new Error('设备信息出错'), { status: 400 });
+        }
+
+        this._refreshStat(publicKey);
         const members = await this.members();
+
+        let joinErr = '';
+        if (this.banUsers.some((u) => u.publicKey === publicKey)) {
+            joinErr = '此设备已被封禁';
+        }
+
+        const info = members.filter((u) => u.public_key === publicKey);
+
         return {
-            joinErr: '',
+            joinErr,
             port: this.wgPort,
+            vpnIp: info.vpn_ip,
             publicKey: this.self ? this.self.public_key : '',
-            memberCount: members.length,
-            members,
+            peers: members.map(this._toMember),
             uptimeMs: this.startedAt ? Date.now() - this.startedAt : 0,
         };
     }
 
-    // 对外只暴露界面需要的字段
-    _toMember(row) {
-        const lastConnect = this.userStat.get(row.public_key) || 0;
-        const curTime = +new Date();
-        return {
-            id: row.id,
-            name: row.name || '匿名',
-            online: curTime - lastConnect < IS_LOST_CONNECT,
-        };
-    }
-
-    async members() {
-        const rows = await this.db.all(
-            `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
-              WHERE status = ${ST_NORMAL} AND id <> ${LOCAL_ID}`,
-        );
-        return rows;
-    }
-
-    async onHeartBeat(body = {}) {
-        const { publicKey = '' } = body;
-        this._refreshStat(publicKey);
-        const peers = await this.members();
-
-        return {
-            menbers: peers.map(this._toMember),
-        };
-    }
-
     // —— 客户端 Join：注册 / 幂等重入 ——
-    async onRegist(body = {}, req) {
+    async onJoin(body = {}, req) {
         const { nickName = '', publicKey = '', guid = '' } = body;
 
         if (!isPublicKey(publicKey) || !guid) {
@@ -235,12 +208,7 @@ SELECT changes() AS changes;`);
 
         const userIp = this._getRemoteIp(req);
 
-        const banUsers = await this.db.all(
-            `SELECT  public_key, ip, guid FROM users
-              WHERE status = ${ST_BANNED} AND id <> ${LOCAL_ID};`,
-        );
-
-        if (banUsers.some((u) => u.guid === guid || u.public_key === publicKey || u.ip.indexOf(userIp) >= 0)) {
+        if (this.banUsers.some((u) => u.guid === guid || u.publicKey === publicKey || u.ip.indexOf(userIp) >= 0)) {
             throw Object.assign(new Error('被封禁的用户不能加入'), { status: 403 });
         }
 
@@ -337,6 +305,28 @@ SELECT changes() AS changes;`);
         return ip;
     }
 
+    // 对外只暴露界面需要的字段
+    _toMember(row) {
+        const lastConnect = this.userStat.get(row.public_key) || 0;
+        const curTime = +new Date();
+        const keepHeartBeat = curTime - lastConnect < IS_LOST_CONNECT;
+        const banded = this.banUsers.some((u) => u.guid === row.guid || u.publicKey === row.public_key || u.ip.indexOf(row.ip) >= 0);
+
+        return {
+            id: row.id,
+            name: row.name || '匿名',
+            online: keepHeartBeat && !banded,
+        };
+    }
+
+    async members() {
+        const rows = await this.db.all(
+            `SELECT id, name, public_key, vpn_ip, ip, guid, status FROM users
+              WHERE status = ${ST_NORMAL} AND id <> ${LOCAL_ID}`,
+        );
+        return rows;
+    }
+
     // 池内最小空闲 IP（10.84.111.2 ~ 254）
     async _allocIp() {
         const rows = await this.db.all(
@@ -353,22 +343,31 @@ SELECT changes() AS changes;`);
     }
 
     // —— 封禁：id 或 publicKey 都收 ——
-    async ban(idOrKey) {
-        return this._setStatus(idOrKey, ST_BANNED);
+    async ban(id = 0, publicKey = '') {
+        return this._setStatus(id, publicKey, ST_BANNED);
     }
 
     // —— 删除（软删除，保留整行以便审计）——
-    async remove(idOrKey) {
-        return this._setStatus(idOrKey, ST_DELETED);
+    async remove(id = 0, publicKey = '') {
+        return this._setStatus(id, publicKey, ST_DELETED);
     }
 
-    async _setStatus(idOrKey, status) {
-        if (idOrKey === undefined || idOrKey === null || idOrKey === '') return false;
+    async resume(id = 0, publicKey = '') {
+        return this._setStatus(id, publicKey, ST_NORMAL);
+    }
 
-        const byId = Number(idOrKey);
-        const where = Number.isInteger(byId) ? `id = ${sqlNum(byId)} AND id <> ${LOCAL_ID}` : `public_key = ${sqlStr(String(idOrKey))}`;
+    async _setStatus(id, publicKey, status) {
+        const byId = Number(id);
 
+        if (!isPublicKey(publicKey) && !byId) return false;
+
+        const where = Number.isInteger(byId) ? `id = ${sqlNum(byId)} AND id <> ${LOCAL_ID}` : `public_key = ${sqlStr(publicKey)}`;
         const changes = await this._changes(`UPDATE users SET status = ${sqlNum(status)} WHERE ${where}`);
+
+        this._getBanUsers().then((list) => {
+            this.banUsers = list;
+        });
+
         return changes > 0;
     }
 }

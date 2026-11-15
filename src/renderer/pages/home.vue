@@ -102,7 +102,7 @@
 
                     <el-button type="success" @click="doStartServe" v-if="mode !== 'serve'">开启服务</el-button>
                     <el-button type="danger" @click="stopServe" v-if="mode === 'serve'">停止服务</el-button>
-                    <el-button type="primary" @click="testJoin" v-if="mode === 'serve'">测试加入</el-button>
+                    <!-- <el-button type="primary" @click="testJoin" v-if="mode === 'serve'">测试加入</el-button> -->
 
                     <span class="spacer"></span>
                     <div class="card" v-if="mode === 'serve'">
@@ -218,7 +218,7 @@ export default {
             nickName: '',
             // 服务器 IP 拆成 4 段，最后用点拼起来（见 computed.ip）
             ipParts: ['', '', '', ''],
-            vpnip: SERVER_VPN_IP,
+            vpnIp: SERVER_VPN_IP,
             serveKey: '',
             serverPort: `${DEFAULT_SERVER_PORT}`,
             wgPort: `${DEFAULT_WG_PORT}`,
@@ -287,7 +287,7 @@ export default {
             this.machineGuid = (await getMachineGuid() || '').replace(/-/g, '');
 
             this.nickName = info.name || '';
-            this.vpnip = info.vpn_ip || SERVER_VPN_IP;
+            this.vpnIp = info.vpn_ip || SERVER_VPN_IP;
             const [ip = '', port = ''] = (info.ip || '').split(':');
 
             this.ipParts = ip.split('.').map((p) => String(p || '').trim());
@@ -353,14 +353,27 @@ export default {
         },
 
         // hub 的 wg.conf：私钥用 sqlite 里 id=0 那行（server.js 的 _ensureSelf 已经准备好了）
-        buildHubConf(wgPort) {
+        async buildServerConf() {
+            await this.serverInst.ready;
             const self = (this.serverInst && this.serverInst.self) || {};
             if (!self.private_key) throw new Error('服务器密钥还没生成');
 
-            const lines = ['[Interface]', `PrivateKey = ${self.private_key}`, `Address = ${SERVER_VPN_IP}/24`, `ListenPort = ${wgPort}`];
+            const peers = (await this.serverInst.members()).map(u => `
+[Peer]
+PublicKey = ${u.public_key}
+AllowedIPs = ${u.vpn_ip}/32
+            `);
 
-            // 成员要互通就得在这里补 [Peer]；成员表一变必须重写 conf 再 up 一次（整装整卸）
-            return `${lines.join('\n')}\n`;
+            return `
+[Interface]
+PrivateKey = ${self.private_key}
+ListenPort = ${this.wgPort}
+Address = ${SERVER_VPN_IP}/24
+MTU = 1280
+PostUp = iptables -A FORWARD -o wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
+
+${peers}`;
         },
 
         async buildClientConf(publicKey, vpnIp = SERVER_VPN_IP, endPoint = `${this.ip}:${this.wgPort}`) {
@@ -392,75 +405,6 @@ PersistentKeepalive = 25
             if (digits !== raw) this.$set(this.ipParts, index, digits);
         },
 
-        // —— 测试加入：在服务端本机走一遍真实的 /join，再把客户端网卡也装起来看效果 ——
-        async testJoin() {
-            if (!this.serverInst) {
-                this.$message.warning('注册服务没起来，先点「开启服务」');
-                return;
-            }
-
-            // 已经装着：再点一次就当收摊
-            if (this.testTunnelUp) {
-                try {
-                    await this.stopTunnel(this.networkName);
-                    this.testTunnelUp = false;
-                    this.$message.info('已卸载测试用的客户端网卡');
-                    this.pollState();
-                } catch (e) {
-                    this.$message.error(this.translateErr(e.message));
-                }
-                return;
-            }
-
-            const regPort = parseInt(this.serverPort, 10) || DEFAULT_SERVER_PORT;
-            const keys = generateKeyPair();
-            const nickName = `测试-${Date.now().toString().slice(-4)}`;
-
-            try {
-                const res = await fetch(`http://127.0.0.1:${regPort}/api/join`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        v: 1,
-                        public_key: keys.publicKey,
-                        id: nickName,
-                        wg_port: DEFAULT_WG_PORT,
-                    }),
-                });
-                const data = await res.json();
-                if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-
-                await this.startTunnel(this.networkName, this.buildTestConf(keys, data));
-                this.testTunnelUp = true;
-                this.$message.success(`已加入：${data.you.vpn_ip}（${nickName}），对端 ${(data.peers || []).length} 个`);
-            } catch (e) {
-                this.$message.error(this.translateErr(e.message));
-            }
-
-            this.pollState();
-        },
-
-        // 测试客户端的 wg.conf：自己一端用新生成的私钥，对端指向本机服务端
-        buildTestConf(keys, data) {
-            const lines = [
-                '[Interface]',
-                `PrivateKey = ${keys.privateKey}`,
-                `Address = ${data.you.vpn_ip}/24`,
-                `ListenPort = ${DEFAULT_WG_PORT + 1}`,
-                '',
-                '[Peer]',
-                `PublicKey = ${data.server.public_key}`,
-                `AllowedIPs = ${data.server.vpn_ip}/32`,
-                `Endpoint = 127.0.0.1:${this.wgPort}`,
-                'PersistentKeepalive = 25',
-            ];
-
-            (data.peers || []).forEach((p) => {
-                lines.push('', '[Peer]', `PublicKey = ${p.public_key}`, `AllowedIPs = ${p.vpn_ip}/32`);
-            });
-
-            return `${lines.join('\n')}\n`;
-        },
         async doStartServe() {
             const serverPort = parseInt(this.serverPort, 10) || DEFAULT_WG_PORT;
             try {
@@ -471,17 +415,18 @@ PersistentKeepalive = 25
                 }
 
                 // 2) 再装虚拟网卡
-                await this.startTunnel(this.networkName, this.buildHubConf(this.wgPort));
+                await this.startTunnel(this.networkName, await this.buildServerConf());
                 this.tunnelUp = true;
                 this.serveKey = (this.serverInst.self && this.serverInst.self.public_key) || '';
                 this.mode = 'serve';
-                console.log(this.serverInst);
+
                 this.serverState = this.serverInst.state || '注册服务已就绪';
             } catch (e) {
                 this.$message.error(this.translateErr(e.message));
             }
             this.pollState();
         },
+
         async doJoin() {
             if (!this.ipValid) {
                 this.$message.warning('请填写完整的服务器 IP（四段都要 0-255）');
@@ -491,16 +436,17 @@ PersistentKeepalive = 25
 
             const serverPort = parseInt(this.serverPort, 10) || 1212;
             try {
-                const info = await Server.updateInfo(this.$db, this.nickName || '', this.vpnip, `${this.ip}:${serverPort}`);
-                const res = await this.post('/api/join', {
-                    nickName: this.nickName, publicKey: info.public_key, guid: this.machineGuid,
-                });
+                const info = await Server.updateInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
+                // const res = await this.post('/api/join', {
+                //     nickName: this.nickName, publicKey: info.public_key, guid: this.machineGuid,
+                // });
                 // await Server.updateInfo(this.$db, this.nickName || '', res.server, `${this.ip}:${serverPort}`);
                 // this.wgPort = res.port;
                 const conf = await this.buildClientConf('pk', '10.100.0.2', `${this.ip}:${this.wgPort}`);
                 console.log(conf);
 
                 await this.startTunnel(this.networkName, conf);
+                this.tunnelUp = true;
 
                 // if (res.error) {
                 //     this.$message.error(res.error);
@@ -517,7 +463,15 @@ PersistentKeepalive = 25
         },
 
         async doDisconnect() {
-            await this.post('/api/disconnect').catch(() => {});
+            try {
+                // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
+                await this.stopTunnel(this.networkName);
+                this.tunnelUp = false;
+            } catch (e) {
+                this.$message.error(this.translateErr(e.message));
+            }
+            this.mode = 'idle';
+
             this.pollState();
         },
         async stopServe() {
@@ -545,6 +499,7 @@ PersistentKeepalive = 25
             this.members = [];
             this.pollState();
         },
+
         // —— 虚拟网卡：起/停都委托给 vlancore（127.0.0.1:7400）——
         // 它只认两件事：给一段 wg.conf 就 /installtunnelservice，给个名字就 /uninstalltunnelservice。
         async startTunnel(name, conf) {
@@ -572,6 +527,7 @@ PersistentKeepalive = 25
             }
             return result;
         },
+
         async ban(pk) {
             await this.post('/api/ban', { publicKey: pk }).catch(() => {});
             this.pollState();
@@ -580,6 +536,7 @@ PersistentKeepalive = 25
             await this.post('/api/delete', { publicKey: pk }).catch(() => {});
             this.pollState();
         },
+
         // 只测连通性：/ping 有响应 = 核心在线；成员表顺带从 serverInst 刷（没有就保持不动）
         async pollState() {
             this.coreOnline = await this.pingCore();
