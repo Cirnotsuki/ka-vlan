@@ -16,10 +16,11 @@
 		"appId": "com.vlan.app",
 		"productName": "KA VLAN",
 		"directories": {
-			"output": "../dist/ka-vlan"
+			"output": "./dist/ka-vlan"
 		},
 		"files": [
 			"dist/**/*",
+			"static/**/*",
 			"package.json",
 			"!core/**"
 		],
@@ -41,7 +42,7 @@
 			"target": [
 				"dir"
 			],
-			"icon": "build/icons/icon.ico"
+			"icon": "static/icon.ico"
 		}
 	},
 	"devDependencies": {
@@ -81,6 +82,8 @@
 		"mini-css-extract-plugin": "0.4.0",
 		"multispinner": "^0.2.1",
 		"node-loader": "^0.6.0",
+		"png-to-ico": "^3.0.2",
+		"sharp": "^0.35.5",
 		"style-loader": "^0.21.0",
 		"terser-webpack-plugin": "^4.2.2",
 		"typescript": "^4.6.3",
@@ -100,6 +103,3 @@
 		"element-ui": "^2.15.14"
 	}
 }
-
-
-

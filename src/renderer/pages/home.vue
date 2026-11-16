@@ -246,9 +246,8 @@
 
                         <div class="kv">
                             <span>端口状态</span>
-                            <span :class="portOK ? 'ok' : 'bad'">
-                                {{ portOK ? "畅通" : "禁用" }}
-                            </span>
+                            <span class="bad" v-if="joinErr">{{ joinErr }}</span>
+                            <span :class="portOK ? 'ok' : 'bad'" v-else>{{ portOK ? "畅通" : "禁用" }}</span>
                         </div>
                     </div>
 
@@ -338,6 +337,8 @@ export default {
             lastTunnelConf: '',
             // 开转发失败的原因（接口每次重建都要重开，失败不阻断服务）
             forwardError: '',
+
+            onStopProcess: false,
         };
     },
     computed: {
@@ -369,12 +370,19 @@ export default {
         ipcRenderer.on('poll:state', this.onNodeState);
         ipcRenderer.send('poll:core:start', { url: this.$api, intervalMs: 2000 });
 
+        // 托盘：动作接进来，状态推出去
+        ipcRenderer.on('tray:action', this.onTrayAction);
+        ipcRenderer.on('tray:focus-join', this.onTrayFocusJoin);
+        this.pushTrayState();
+
         // 关窗/刷新的兜底：页面卸载前把虚拟网卡卸掉
         window.addEventListener('beforeunload', this.onWindowClose);
     },
     beforeDestroy() {
         ipcRenderer.removeListener('poll:core', this.onCoreStatus);
         ipcRenderer.removeListener('poll:state', this.onNodeState);
+        ipcRenderer.removeListener('tray:action', this.onTrayAction);
+        ipcRenderer.removeListener('tray:focus-join', this.onTrayFocusJoin);
         ipcRenderer.send('poll:core:stop');
         ipcRenderer.send('poll:state:stop');
 
@@ -395,7 +403,10 @@ export default {
             console.log(issue);
             if (!issue || issue.ok) return;
 
-            const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const esc = (s) => String(s || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
             const msg = [
                 `程序所在路径包含中文或其他非 ASCII 字符：<br><code>${esc(issue.path)}</code>`,
                 'WireGuard 的隧道服务由 LocalSystem 启动，无法从这类路径加载 <code>wireguard.exe</code>（Windows 事件 7023：拒绝访问），虚拟网卡会创建失败。',
@@ -602,6 +613,39 @@ PersistentKeepalive = 25`;
                 this.joinErr = this.translateErr(e.message);
             }
         },
+
+        // —— 托盘：状态推送 + 动作分发（业务复用现有方法，不另起炉灶） ——
+        pushTrayState() {
+            const connected = this.mode === 'serve' ? !!this.tunnelUp : this.mode === 'join' ? !!this.tunnelUp : false;
+
+            ipcRenderer.send('tray:state', {
+                mode: this.onStopProcess ? 'stoping' : this.mode, connected, vpnIp: this.vpnIp, joinErr: this.joinErr,
+            });
+        },
+        onTrayAction(evt, action) {
+            if (action === 'start-serve' && this.mode === 'idle') {
+                this.doStartServe();
+            } else if (action === 'stop-serve' && this.mode === 'serve') {
+                this.stopServe(null, true); // 托盘触发免确认
+            } else if (action === 'join' && this.mode === 'idle') {
+                if (this.ipValid) {
+                    this.doJoin(); // 参数齐全：不弹窗，直接加入
+                } else {
+                    // 缺参数：唤起主窗口让用户补全
+                    ipcRenderer.send('tray:need-window');
+                    this.$nextTick(() => this.onTrayFocusJoin());
+                    this.$message.info('请先在主窗口填写服务器地址');
+                }
+            } else if (action === 'leave' && this.mode === 'join') {
+                this.doDisconnect();
+            }
+        },
+        onTrayFocusJoin() {
+            this.$nextTick(() => {
+                const el = document.querySelector('.ip-octet input, .ip-octet');
+                if (el) el.focus();
+            });
+        },
         async refreshMenbers() {
             if (!this.serverInst) return;
             await this.serverInst.ready;
@@ -638,9 +682,13 @@ PersistentKeepalive = 25`;
         },
 
         async doStartServe() {
+            if (this.mode !== 'idle') return;
+
             const serverPort = parseInt(this.serverPort, 10) || DEFAULT_SERVER_PORT;
+            this.mode = 'starting';
+            this.pushTrayState();
+
             try {
-                this.mode = 'starting';
                 // 1) Node 侧先把注册服务立起来（成员表落在 sqlite）
                 if (!this.serverInst) {
                     this.serverInst = new Server(this.$db, serverPort);
@@ -686,21 +734,28 @@ PersistentKeepalive = 25`;
                 }
             }
             this.pollState();
+            this.pushTrayState();
         },
 
-        async stopServe() {
-            try {
-                await this.$confirm('停止服务并关闭端口？', '确认', { type: 'warning' });
-            } catch (e) {
-                return; // 用户取消
+        async stopServe(e, skipConfirm) {
+            if (this.onStopProcess) return; // 正在停止中
+
+            if (!skipConfirm) {
+                try {
+                    await this.$confirm('停止服务并关闭端口？', '确认', { type: 'warning' });
+                } catch (_) {
+                    return; // 用户取消
+                }
             }
 
+            this.onStopProcess = true;
+            this.pushTrayState();
             try {
                 // 先关转发再卸网卡（接口没了转发设置也跟着消失，这里只是显式收一下）
                 await this.setForwarding(false).catch(() => {});
                 await this.stopTunnel(this.networkName);
                 this.tunnelUp = false;
-            } catch (e) {
+            } catch (_) {
                 this.$message.error(this.translateErr(e.message));
             }
 
@@ -714,24 +769,35 @@ PersistentKeepalive = 25`;
             this.statusMsg = '';
             this.members = [];
             this.pollState();
+            this.pushTrayState();
+
+            this.onStopProcess = false;
+            this.pushTrayState();
         },
 
         async doJoin() {
+            if (this.mode !== 'idle') return;
+
             if (!this.ipValid) {
                 this.$message.warning('请填写完整的服务器 IP（四段都要 0-255）');
                 return;
             }
             this.mode = 'joining';
+            this.pushTrayState();
 
             const serverPort = parseInt(this.serverPort, 10) || 1212;
             try {
                 const info = await Server.updateLocalInfo(this.$db, this.nickName || '', this.vpnIp, `${this.ip}:${serverPort}`);
                 // 注意 base：/api/join 在远端服务器上，不是本机 7400 核心
-                const res = await this.post('/api/join', {
-                    nickName: this.nickName,
-                    publicKey: info.public_key,
-                    guid: this.machineGuid,
-                }, `http://${this.ip}:${serverPort}`);
+                const res = await this.post(
+                    '/api/join',
+                    {
+                        nickName: this.nickName,
+                        publicKey: info.public_key,
+                        guid: this.machineGuid,
+                    },
+                    `http://${this.ip}:${serverPort}`,
+                );
 
                 this.vpnIp = res.vpnIp;
                 this.serverKey = res.serverKey;
@@ -768,9 +834,14 @@ PersistentKeepalive = 25`;
                 console.error(e);
             }
             this.pollState();
+            this.pushTrayState();
         },
 
         async doDisconnect() {
+            if (this.onStopProcess) return; // 正在停止中
+            this.onStopProcess = true;
+            this.pushTrayState();
+
             try {
                 // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
                 await this.stopTunnel(this.networkName);
@@ -786,6 +857,9 @@ PersistentKeepalive = 25`;
             this.mode = 'idle';
 
             this.pollState();
+
+            this.onStopProcess = false;
+            this.pushTrayState();
         },
 
         // —— 虚拟网卡：起/停都委托给 vlancore（127.0.0.1:7400）——
@@ -868,6 +942,7 @@ PersistentKeepalive = 25`;
                 this.$message.error(this.translateErr(e.message));
             }
             this.pollState();
+            this.pushTrayState();
         },
 
         async resume(row) {
@@ -881,6 +956,7 @@ PersistentKeepalive = 25`;
                 this.$message.error(this.translateErr(e.message));
             }
             this.pollState();
+            this.pushTrayState();
         },
 
         async ban(row) {
@@ -894,6 +970,7 @@ PersistentKeepalive = 25`;
                 this.$message.error(this.translateErr(e.message));
             }
             this.pollState();
+            this.pushTrayState();
         },
         async remove(row) {
             if (!this.serverInst) return;
@@ -912,6 +989,7 @@ PersistentKeepalive = 25`;
                 this.$message.error(this.translateErr(e.message));
             }
             this.pollState();
+            this.pushTrayState();
         },
 
         // 本地刷一次（Serve 模式下成员表在 serverInst 里，不走 HTTP）

@@ -14,6 +14,7 @@ import fs from 'fs'; //  clipboard, screen, desktopCapturer,
 import IpcScreenshot from './ipcScreenshot';
 import IpcManager from './ipcManager';
 import Poller from './poller';
+import TrayManager from './tray';
 
 /**
  * Set `__static` path to static files in production
@@ -22,6 +23,8 @@ import Poller from './poller';
 if (process.env.NODE_ENV !== 'development') {
     global.__static = require('path').join(__dirname, '/static').replace(/\\/g, '\\\\');
 }
+
+export const WindowTitle = 'KA-VLAN 组网';
 
 // —— userData 目录初始化：稳定落在 %APPDATA%\vlan（次选 %LOCALAPPDATA%\vlan），实测可写才启用 ——
 // 五段探针逐段记录失败点：mkdir → open → write → close → unlink
@@ -96,7 +99,7 @@ function initUserData() {
     errors.forEach((s) => console.error(`  - ${s}`));
     console.error('[VLAN] 判读：cmd.exe 能写而本进程不能 → 安全软件在针对本 exe；cmd.exe 也不能写 → 目录/策略层面限制');
     shellLog(`userData 初始化失败: ${errors.join(' | ')}`);
-    dialog.showErrorBox('VLAN 组网', `应用数据目录初始化失败：\n${errors.join('\n')}\n\n详见 shell 日志`);
+    dialog.showErrorBox(WindowTitle, `应用数据目录初始化失败：\n${errors.join('\n')}\n\n详见 shell 日志`);
     app.exit(1);
     return null;
 }
@@ -122,6 +125,9 @@ try {
     shellLogPath = null; // 日志目录同样可能不可写，退化成不写日志，不影响启动
 }
 function shellLog(msg) {
+    if (process.env.NODE_ENV === 'development') {
+        console.log(`[shellLog] ${msg}`);
+    }
     if (!shellLogPath) return;
     try {
         fs.appendFileSync(shellLogPath, `${new Date().toISOString()} ${msg}\n`);
@@ -137,11 +143,6 @@ if (process.env.VLAN_DISABLE_GPU === '1') {
     console.log('[VLAN] 已按 VLAN_DISABLE_GPU=1 禁用硬件加速');
 }
 
-// 定义全局变量，所有窗口共享，通过ipcMain和ipcRenderer实现设置更改
-global.ZLTB_DATA = {
-    KEYNO: '', // 加密狗编号
-};
-
 // win7 禁用硬件加速（程序黑屏）
 if (os.release().startsWith('6.1')) {
     app.disableHardwareAcceleration();
@@ -149,6 +150,20 @@ if (os.release().startsWith('6.1')) {
 
 const CORE_PORT = 7400;
 
+let mainWindow = null;
+let trayManager = null;
+let forceQuit = false; // 托盘「退出」置位后，close 不再隐藏而是真关
+const winURL = process.env.NODE_ENV === 'development' ? 'http://localhost:9080/' : `file://${__dirname}/`;
+
+function setWindowTitle(str) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        if (str) {
+            mainWindow.setTitle(`${WindowTitle} - ${str}`);
+        } else {
+            mainWindow.setTitle(WindowTitle);
+        }
+    }
+}
 function corePath() {
     // 按优先级列出核心可能落地的位置，取第一个真实存在的；顺序覆盖打包版 / 开发版 / 仓库根的最新构建
     const appDir = app.getAppPath();
@@ -168,12 +183,18 @@ function corePath() {
 
 function httpOK(p) {
     return new Promise((resolve) => {
-        const req = http.get({
-            host: '127.0.0.1', port: CORE_PORT, path: p, timeout: 1200,
-        }, (res) => {
-            res.resume();
-            resolve(res.statusCode === 200);
-        });
+        const req = http.get(
+            {
+                host: '127.0.0.1',
+                port: CORE_PORT,
+                path: p,
+                timeout: 1200,
+            },
+            (res) => {
+                res.resume();
+                resolve(res.statusCode === 200);
+            },
+        );
         req.on('error', () => resolve(false));
         req.on('timeout', () => {
             req.destroy();
@@ -186,24 +207,29 @@ async function startCore() {
     // 探活只能用 /ping：精简后的核心没有 /api/state，用旧路径会一直判成"没起来"，
     // 于是每次启动都再拉一个核心去抢 7400，老进程却一直占着端口
     if (await httpOK('/ping')) {
+        setWindowTitle('已有实例');
         shellLog('startCore: 已有实例');
         return;
     }
     const exe = corePath();
     if (!fs.existsSync(exe)) {
+        setWindowTitle(`核心缺失 ${exe}`);
         shellLog(`startCore: 核心缺失 ${exe}`);
         throw new Error(`找不到核心: ${exe}`);
     }
+    setWindowTitle(`提权拉起 ${exe}`);
     shellLog(`startCore: 提权拉起 ${exe}`);
     const ps = `Start-Process -FilePath '${exe}' -WorkingDirectory '${path.dirname(exe)}' -WindowStyle Hidden -Verb RunAs`;
     spawn('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true });
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 30; i += 1) {
         await new Promise((r) => setTimeout(r, 500));
         if (await httpOK('/ping')) {
+            setWindowTitle(`核心就绪 (等待 ${(i + 1) * 0.5}s)`);
             shellLog(`startCore: 核心就绪 (等待 ${(i + 1) * 0.5}s)`);
             return;
         }
     }
+    setWindowTitle('15 秒内核心未就绪');
     shellLog('startCore: 15 秒内核心未就绪');
     throw new Error('核心进程启动失败（若 UAC 弹窗被取消请重试）');
 }
@@ -222,9 +248,51 @@ async function stopCore() {
     });
     exec('taskkill /F /IM vlancore.exe', { windowsHide: true }, () => {});
 }
+function showMainWindow() {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        createWindow();
+        return;
+    }
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+}
 
-let mainWindow = null;
-const winURL = process.env.NODE_ENV === 'development' ? 'http://localhost:9080/' : `file://${__dirname}/`;
+function requestQuit() {
+    shellLog('托盘请求退出');
+    forceQuit = true;
+    if (trayManager) {
+        trayManager.destroy();
+        trayManager = null;
+    }
+    if (mainWindow) {
+        mainWindow.close(); // 触发 window-all-closed → 停核心 → app.quit
+    } else {
+        app.quit();
+    }
+}
+
+function handleTrayAction(action) {
+    shellLog(`托盘动作 [${action}] → 转发渲染层`);
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        shellLog(`托盘动作 ${action}: 无窗口可接收`);
+        return;
+    }
+    // 业务全在 home.vue（sqlite 注册服务 + 隧道安装都在那边），主进程只转发
+    mainWindow.webContents.send('tray:action', action);
+}
+
+function initTray() {
+    trayManager = new TrayManager({
+        getAppPath: () => app.getAppPath(),
+        getWindow: () => mainWindow,
+        onShow: () => showMainWindow(),
+        onAction: (a) => handleTrayAction(a),
+        onQuit: () => requestQuit(),
+    });
+    trayManager.create();
+    shellLog('托盘已创建');
+}
 
 function createWindow() {
     shellLog('createWindow: 创建主窗口');
@@ -235,8 +303,8 @@ function createWindow() {
         minHeight: 768,
         center: true,
         backgroundColor: '#f3f5f7',
-        title: 'Vlan 组网',
-        icon: './renderer/assets/logo.ico',
+        title: WindowTitle,
+        icon: path.join(__static, 'icon.ico'),
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false,
@@ -247,6 +315,15 @@ function createWindow() {
     });
 
     mainWindow.loadURL(`${winURL}index.html`);
+
+    // 点关闭按钮 = 隐藏到托盘常驻，不退出（真正的退出走托盘菜单）
+    mainWindow.on('close', (e) => {
+        if (!forceQuit) {
+            e.preventDefault();
+            mainWindow.hide();
+            shellLog('窗口关闭→隐藏到托盘');
+        }
+    });
 
     mainWindow.on('closed', () => {
         mainWindow = null;
@@ -304,11 +381,24 @@ ipcMain.on('poll:state:stop', () => {
     poller.stopState();
 });
 
+// —— 托盘通道：home.vue 推状态、接动作；缺参数时把窗口唤起来 ——
+ipcMain.on('tray:state', (e, s) => {
+    if (trayManager) trayManager.update(s || {});
+});
+ipcMain.on('tray:need-window', () => {
+    showMainWindow();
+    try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('tray:focus-join');
+        }
+    } catch (_) { /* 焦点失败不致命 */ }
+});
+
 // 限制单实例应用（必须在 userData 初始化之后：单例锁就存在 userData 目录里）
 const curInstance = app.requestSingleInstanceLock();
 if (!curInstance) {
     console.error(
-        '[VLAN] 获取单实例锁失败：已有实例在运行，或同一 userData 目录被其他进程占用（可用任务管理器清理残留的 electron.exe / VLAN组网.exe）',
+        '[VLAN] 获取单实例锁失败：已有实例在运行，或同一 userData 目录被其他进程占用（可用任务管理器清理残留的 electron.exe / VLAN 组网.exe）',
     );
     shellLog('单实例锁获取失败，退出');
     app.quit();
@@ -327,6 +417,7 @@ if (!curInstance) {
         // 路径自检：中文/非 ASCII 路径下，WireGuard 的隧道服务（LocalSystem）加载不了 exe
         // 路径自检的弹窗由渲染层负责（home.vue 通过 path:check 询问）
         createWindow();
+        initTray();
         shellLog('whenReady: 窗口已创建，后台拉起核心');
         startCore()
             .then(() => shellLog('startCore: 成功'))
@@ -337,9 +428,7 @@ if (!curInstance) {
                     if (mainWindow && !mainWindow.isDestroyed()) {
                         mainWindow.webContents.send('core-status', { ok: false, message: msg });
                     }
-                    if (mainWindow && !mainWindow.isDestroyed()) {
-                        mainWindow.setTitle('VLAN 组网 - 核心未就绪');
-                    }
+                    setWindowTitle('核心未就绪');
                 } catch (_) {
                     /* 提示通道也不能反过来把主进程搞崩 */
                 }
@@ -349,11 +438,19 @@ if (!curInstance) {
 
 app.on('window-all-closed', async () => {
     shellLog('window-all-closed: 停核心');
+    if (trayManager) {
+        trayManager.destroy();
+        trayManager = null;
+    }
     if (poller) poller.dispose();
     await stopCore();
     if (process.platform !== 'darwin') {
         app.quit();
     }
+});
+
+app.on('before-quit', () => {
+    forceQuit = true; // 任何退出路径都不再走"隐藏"
 });
 
 app.on('activate', () => {

@@ -1,4 +1,4 @@
-# VLAN 组网
+# KA-VLAN 组网
 
 Windows 桌面端的 WireGuard 组网工具：一台机器开服务（Hub），其他机器填 IP 加入，加入后通过虚拟网卡互相访问。
 
