@@ -257,6 +257,37 @@ function createWindow() {
     mainWindow.webContents.closeDevTools();
 }
 
+// —— 启动自检：程序路径含中文/非 ASCII 时，WireGuard 的隧道服务（LocalSystem）加载不了 exe ——
+// 只负责判断，弹窗交给渲染层（home.vue），用户点确定后由那边发 app:quit 退出
+function isAsciiPath(p) {
+    return /^[\x20-\x7E]*$/.test(String(p || ''));
+}
+
+function installPathIssue() {
+    // 开发模式目录本来就在中文路径下（D:\DS 工作\...），不拦；发行版才提示
+    if (!app.isPackaged) return null;
+
+    const coreDir = path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(), 'core');
+    const bundled = path.join(coreDir, 'wg', 'wireguard.exe');
+
+    // 只有"应用自带 WireGuard"时路径才要紧；用系统那份的话装在哪都行
+    if (!fs.existsSync(bundled)) return null;
+    if (isAsciiPath(bundled)) return null;
+
+    shellLog(`路径自检：自带 WireGuard 位于非 ASCII 路径 ${bundled}`);
+    return { path: bundled };
+}
+
+ipcMain.handle('path:check', () => {
+    const issue = installPathIssue();
+    return issue ? { ok: false, path: issue.path } : { ok: true };
+});
+
+ipcMain.on('app:quit', () => {
+    shellLog('路径自检未通过，用户确认后退出');
+    app.quit();
+});
+
 // —— 轮询在主进程：渲染层只负责起停和收结果 ——
 // 都用 setTimeout 串行，上一轮有结果才排下一轮，不会像 setInterval 那样在慢网络下堆请求
 const poller = new Poller(() => mainWindow);
@@ -293,7 +324,8 @@ if (!curInstance) {
     });
 
     app.whenReady().then(() => {
-        // 界面优先：窗口先起来，核心放在后台拉，核心的任何失败都不许影响 GUI
+        // 路径自检：中文/非 ASCII 路径下，WireGuard 的隧道服务（LocalSystem）加载不了 exe
+        // 路径自检的弹窗由渲染层负责（home.vue 通过 path:check 询问）
         createWindow();
         shellLog('whenReady: 窗口已创建，后台拉起核心');
         startCore()

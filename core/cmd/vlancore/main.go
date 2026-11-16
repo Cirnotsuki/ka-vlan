@@ -39,18 +39,71 @@ var (
 	confDir string
 )
 
-// —— 找 wireguard.exe：PATH 优先，其次默认安装目录 ——
-func wireguardExe() string {
-	if p, err := exec.LookPath("wireguard.exe"); err == nil {
-		return p
-	}
-	for _, p := range []string{
-		`C:\Program Files\WireGuard\wireguard.exe`,
-		`C:\Program Files (x86)\WireGuard\wireguard.exe`,
-	} {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
+// —— 找 wireguard.exe ——
+// 顺序：应用自带的（<exe目录>\wg）→ PATH → 系统默认安装目录。
+// 注意：隧道服务的 ImagePath 会指向实际使用的那个绝对路径，所以安装目录不能随便挪（挪之前先卸隧道）。
+// 自带的排在前面，但如果它的服务起不来（例如应用装在含中文/空格的路径下），
+// tunnelUp 会自动换下一个候选，不影响使用。
+func wireguardCandidates() []string {
+	var out []string
+	seen := map[string]bool{}
+	bundledDir := filepath.Join(exeDir(), "wg")
+
+	add := func(p string) {
+		if p == "" {
+			return
 		}
+		// PATH 里可能有相对项（"wireguard.exe"），统一转成绝对路径再用
+		if !filepath.IsAbs(p) {
+			if abs, err := filepath.Abs(p); err == nil {
+				p = abs
+			} else {
+				return
+			}
+		}
+		key := strings.ToLower(p)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if !fileExists(p) {
+			return
+		}
+		out = append(out, p)
+	}
+
+	add(filepath.Join(bundledDir, "wireguard.exe"))
+
+	if p, err := exec.LookPath("wireguard.exe"); err == nil {
+		add(p)
+	}
+
+	add(`C:\Program Files\WireGuard\wireguard.exe`)
+	add(`C:\Program Files (x86)\WireGuard\wireguard.exe`)
+
+	// 含非 ASCII 字符的路径照样参与：能不能启动由 tunnelUp 实测，起不来再自动换下一个候选。
+	// （实测路径含中文时隧道服务会以「拒绝访问」退出，事件日志 7023，但那属于运行时失败，不是这里该预判的）
+	for _, p := range out {
+		if !isASCII(p) {
+			log.Printf("注意：%s 路径含非 ASCII 字符，若隧道服务起不来会自动改用下一个候选", p)
+		}
+	}
+
+	return out
+}
+
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func wireguardExe() string {
+	if list := wireguardCandidates(); len(list) > 0 {
+		return list[0]
 	}
 	return ""
 }
@@ -76,9 +129,16 @@ func tunnelUp(name, conf string, port int) (string, error) {
 	if strings.TrimSpace(conf) == "" {
 		return "", fmt.Errorf("conf 内容为空")
 	}
-	exe := wireguardExe()
-	if exe == "" {
-		return "", fmt.Errorf("找不到 wireguard.exe（PATH 和 Program Files 都没有）")
+	exes := wireguardCandidates()
+	if len(exes) == 0 {
+		// 自带的那份因为路径含中文被跳过了：给出能看懂的原因，别报"找不到 wireguard.exe"
+		if !isASCII(exeDir()) && fileExists(filepath.Join(exeDir(), "wg", "wireguard.exe")) {
+			return "", fmt.Errorf(
+				"程序路径含中文/非 ASCII 字符（%s），Windows 隧道服务无法从这里启动 wireguard.exe；请把程序移到纯英文路径，或安装 WireGuard 以使用系统那份",
+				exeDir(),
+			)
+		}
+		return "", fmt.Errorf("找不到 wireguard.exe（应用自带目录 wg\\、PATH 和 Program Files 都没有）")
 	}
 
 	dir := tunnelsDir()
@@ -90,25 +150,43 @@ func tunnelUp(name, conf string, port int) (string, error) {
 		return "", fmt.Errorf("写 conf 失败: %v", err)
 	}
 
-	// 旧隧道还在跑时 install 会直接失败（Tunnel already installed），先卸干净
-	runWG(exe, "/uninstalltunnelservice", name)
+	// 逐个候选尝试：自带的排在前面，但它的服务可能起不来（例如应用装在含中文/空格的路径下，
+	// 隧道服务的 ImagePath 指向那里会启动失败）。一个候选失败就卸载干净换下一个。
+	var lastErr error
 
-	if out, err := runWG(exe, "/installtunnelservice", p); err != nil {
-		return "", fmt.Errorf("安装隧道失败: %v %s", err, strings.TrimSpace(out))
+	for i, exe := range exes {
+		// 旧隧道还在跑时 install 会直接失败（Tunnel already installed），先卸干净
+		runWG(exe, "/uninstalltunnelservice", name)
+
+		out, err := runWG(exe, "/installtunnelservice", p)
+		if err != nil {
+			lastErr = fmt.Errorf("%s 安装失败: %v %s", exe, err, firstLine(out))
+			continue
+		}
+
+		// installtunnelservice 只要把服务注册上就返回 0 —— 配置有问题/路径不合适时服务会立刻退出，
+		// 网卡根本不会出现，但调用方看到的是成功。这里必须再确认服务真的 RUNNING。
+		// 非最后一个候选少等一会儿：失败的常见形态就是立刻停，没必要每条都等满 6 秒。
+		wait := 3 * time.Second
+		if i == len(exes)-1 {
+			wait = 6 * time.Second
+		}
+
+		if err := waitTunnelRunning(name, wait); err != nil {
+			runWG(exe, "/uninstalltunnelservice", name) // 别留一个起不来的服务
+			lastErr = fmt.Errorf("%s: %v%s", filepath.Base(filepath.Dir(exe)), err, tunnelLogTail(name))
+			continue
+		}
+
+		log.Printf("wireguard.exe = %s", exe)
+		mu.Lock()
+		tunnels[name] = p
+		mu.Unlock()
+		log.Printf("tunnel up: %s -> %s", name, p)
+		return p, nil
 	}
 
-	// installtunnelservice 只要把服务注册上就返回 0 —— 配置有问题时服务会立刻退出，
-	// 网卡根本不会出现，但调用方看到的是成功。这里必须再确认服务真的 RUNNING。
-	if err := waitTunnelRunning(name, 6*time.Second); err != nil {
-		runWG(exe, "/uninstalltunnelservice", name) // 别留一个起不来的服务
-		return "", fmt.Errorf("%v%s", err, tunnelLogTail(name))
-	}
-
-	mu.Lock()
-	tunnels[name] = p
-	mu.Unlock()
-	log.Printf("tunnel up: %s -> %s", name, p)
-	return p, nil
+	return "", lastErr
 }
 
 // 轮询服务状态，直到 RUNNING / 超时
@@ -168,9 +246,32 @@ func tunnelLogTail(name string) string {
 	return "\n最近日志:\n" + strings.Join(lines, "\n")
 }
 
+// PowerShell 的报错第一行才有用，后面全是 CIM 查询细节，日志里留一句就够
 func firstLine(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	return lines[0]
+	normalized := strings.ReplaceAll(s, "\r", "\n")
+
+	for _, raw := range strings.Split(normalized, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+
+		for _, prefix := range []string{"Get-NetIPAddress :", "Set-NetIPInterface :", "Get-NetIPInterface :"} {
+			line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+
+		if i := strings.Index(strings.ToUpper(line), "CIM"); i == 0 {
+			continue // 整行都是 CIM 细节，换下一行
+		} else if i > 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+
+		if line != "" {
+			return line
+		}
+	}
+
+	return ""
 }
 
 // 关虚拟网卡
@@ -256,8 +357,51 @@ type peerReq struct {
 	Conf string `json:"conf"`
 }
 
-// —— 热更新 peers：不重装隧道，直接 wg set ——
-// conf 会照样落盘（下次重装时不会丢成员），运行中的接口用 wg.exe 增量同步：
+type forwardReq struct {
+	IP     string `json:"ip"`
+	Enable *bool  `json:"enable"` // 省略 = true
+}
+
+// —— IPv4 转发开关 ——
+// 必须由核心来做：核心是提权进程，渲染层里 spawn 的 PowerShell 是普通用户，
+// Set-NetIPInterface 会直接被拒（Access is denied）。
+// 转发是网卡属性，隧道每次重装接口都会重建，所以每次 up 之后都要重新打开。
+func setForwarding(ip string, enable bool) error {
+	if ip == "" {
+		return fmt.Errorf("缺少 ip")
+	}
+
+	action := "Enabled"
+	if !enable {
+		action = "Disabled"
+	}
+
+	script := fmt.Sprintf(`
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$addr = Get-NetIPAddress -IPAddress '%s' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+Set-NetIPInterface -InterfaceIndex $addr.InterfaceIndex -AddressFamily IPv4 -Forwarding %s -ErrorAction Stop
+$r = Get-NetIPInterface -InterfaceIndex $addr.InterfaceIndex -AddressFamily IPv4
+if ($r.Forwarding -ne '%s') { throw 'verify failed: forwarding not %s' }
+Write-Output 'ok'
+`, ip, action, action, action)
+
+	out, err := exec.Command(
+		"powershell.exe",
+		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+		"-Command", script,
+	).CombinedOutput()
+
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return fmt.Errorf("设置 %s 转发失败: %v %s", ip, err, firstLine(text))
+	}
+
+	log.Printf("forwarding: %s -> %v", ip, enable)
+	return nil
+}
+
+// —— 热更新 peers：不重装隧道，直接 wg set ——// conf 会照样落盘（下次重装时不会丢成员），运行中的接口用 wg.exe 增量同步：
 //   wg set <name> peer <pub> allowed-ips <...> [endpoint <...>] [persistent-keepalive N]
 //   不在新 conf 里的旧 peer 用 `peer <pub> remove` 删掉
 type wgPeer struct {
@@ -308,21 +452,41 @@ func parsePeers(conf string) []wgPeer {
 }
 
 func wgExePath() string {
-	if p, err := exec.LookPath("wg.exe"); err == nil {
+	// 1) 应用自带
+	if p := filepath.Join(exeDir(), "wg", "wg.exe"); fileExists(p) {
 		return p
 	}
-	if w, err := exec.LookPath("wireguard.exe"); err == nil {
+	// 2) 跟 wireguard.exe 同目录（自带或系统装的都在同一份安装里）
+	if w := wireguardExe(); w != "" {
 		cand := filepath.Join(filepath.Dir(w), "wg.exe")
-		if _, err := os.Stat(cand); err == nil {
+		if fileExists(cand) {
 			return cand
 		}
 	}
+	// 3) PATH
+	if p, err := exec.LookPath("wg.exe"); err == nil {
+		return p
+	}
 	for _, p := range []string{`C:\Program Files\WireGuard\wg.exe`, `C:\Program Files (x86)\WireGuard\wg.exe`} {
-		if _, err := os.Stat(p); err == nil {
+		if fileExists(p) {
 			return p
 		}
 	}
 	return ""
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// exeDir 当前可执行文件所在目录（开发时是 core\，打包后是 resources\core\）
+func exeDir() string {
+	ex, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(ex)
 }
 
 func tunnelSetPeers(name, conf string) (map[string]interface{}, error) {
@@ -332,8 +496,9 @@ func tunnelSetPeers(name, conf string) (map[string]interface{}, error) {
 
 	wg := wgExePath()
 	if wg == "" {
-		return nil, fmt.Errorf("找不到 wg.exe")
+		return nil, fmt.Errorf("找不到 wg.exe（应用自带目录 wg\\、PATH 和 Program Files 都没有）")
 	}
+	log.Printf("wg.exe = %s", wg)
 
 	// 1) conf 落盘：下次 /tunnel/up 重装时成员还在
 	dir := tunnelsDir()
@@ -448,6 +613,25 @@ func serve() {
 			return
 		}
 		writeJSON(w, 200, map[string]interface{}{"ok": true, "name": req.Name, "stat": stat})
+	})
+
+	mux.HandleFunc("/tunnel/forward", func(w http.ResponseWriter, r *http.Request) {
+		var req forwardReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad_request: " + err.Error()})
+			return
+		}
+
+		enable := true
+		if req.Enable != nil {
+			enable = *req.Enable
+		}
+
+		if err := setForwarding(req.IP, enable); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{"ok": true, "ip": req.IP, "enable": enable})
 	})
 
 	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {

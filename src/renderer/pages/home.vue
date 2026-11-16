@@ -266,7 +266,7 @@
 <script>
 import './home.less';
 import Server from '../utils/server';
-import { getMachineGuid, formatDate, enableForwarding } from '../utils/helper';
+import { getMachineGuid, formatDate } from '../utils/helper';
 // 对应 ui/index.html 的 Vue 页面版：
 // 状态全部走 vlancore 的 127.0.0.1:7400 HTTP API
 import {
@@ -362,6 +362,7 @@ export default {
     mounted() {
         this.init();
         this.pollState();
+        this.checkInstallPath();
 
         // 轮询全部搬去主进程：这里只挂接收器，主进程用 webContents.send 推结果回来
         ipcRenderer.on('poll:core', this.onCoreStatus);
@@ -380,6 +381,42 @@ export default {
         window.removeEventListener('beforeunload', this.onWindowClose);
     },
     methods: {
+        // 启动自检：程序路径含中文时，WireGuard 隧道服务（LocalSystem）加载不了 exe。
+        // 弹窗确认后直接退出，避免用户带着坏路径继续用。
+        async checkInstallPath() {
+            let issue = null;
+
+            try {
+                issue = await ipcRenderer.invoke('path:check');
+            } catch (e) {
+                return; // 主进程没挂这个 handler 就跳过，别拦着用
+            }
+
+            console.log(issue);
+            if (!issue || issue.ok) return;
+
+            const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const msg = [
+                `程序所在路径包含中文或其他非 ASCII 字符：<br><code>${esc(issue.path)}</code>`,
+                'WireGuard 的隧道服务由 LocalSystem 启动，无法从这类路径加载 <code>wireguard.exe</code>（Windows 事件 7023：拒绝访问），虚拟网卡会创建失败。',
+                '请把整个程序目录移动到纯英文路径（例如 <code>C:\\VLAN</code>）后重新运行。',
+                '如果本机已经安装 WireGuard，程序会自动改用系统那份，功能不受影响。',
+            ].join('<br><br>');
+
+            try {
+                await this.$alert(msg, '程序路径包含中文', {
+                    type: 'error',
+                    showClose: false,
+                    confirmButtonText: '确定',
+                    dangerouslyUseHTMLString: true,
+                });
+            } catch (e) {
+                // 关掉弹窗也按"确定"处理
+            }
+
+            ipcRenderer.send('app:quit');
+        },
+
         async init() {
             await this.$db.init();
             const info = await Server.getLocalInfo(this.$db, LOCAL_NAME, SERVER_VPN_IP, '');
@@ -601,7 +638,7 @@ PersistentKeepalive = 25`;
         },
 
         async doStartServe() {
-            const serverPort = parseInt(this.serverPort, 10) || DEFAULT_WG_PORT;
+            const serverPort = parseInt(this.serverPort, 10) || DEFAULT_SERVER_PORT;
             try {
                 this.mode = 'starting';
                 // 1) Node 侧先把注册服务立起来（成员表落在 sqlite）
@@ -616,10 +653,11 @@ PersistentKeepalive = 25`;
                 this.tunnelUp = true;
 
                 // 3) 隧道起来之后才开 IPv4 转发：接口是刚建的，forwarding 属性跟着接口走，
-                //    每次重装都要重开；失败只提示，不阻断服务
+                //    每次重装都要重开；失败只提示，不阻断服务。
+                //    注意必须由核心去设：渲染层 spawn 的 PowerShell 是普通权限，Set-NetIPInterface 会被拒。
                 this.forwardError = '';
                 try {
-                    await enableForwarding(this.serverInst.self ? this.serverInst.self.vpn_ip : this.vpnIp);
+                    await this.setForwarding(true);
                 } catch (fe) {
                     this.forwardError = `IPv4 转发未开启：${this.translateErr(fe.message)}`;
                     this.$message.warning('IPv4 转发未开启，成员之间可能不通');
@@ -658,7 +696,8 @@ PersistentKeepalive = 25`;
             }
 
             try {
-                // 先卸虚拟网卡（这一步要管理员权限），再关 Node 的注册服务
+                // 先关转发再卸网卡（接口没了转发设置也跟着消失，这里只是显式收一下）
+                await this.setForwarding(false).catch(() => {});
                 await this.stopTunnel(this.networkName);
                 this.tunnelUp = false;
             } catch (e) {
@@ -798,6 +837,22 @@ PersistentKeepalive = 25`;
             const result = await res.json();
             if (!res.ok || result.error) {
                 throw new Error(result.error || `关闭隧道失败（HTTP ${res.status}）`);
+            }
+            return result;
+        },
+
+        // IPv4 转发交给核心去设（核心是提权进程）；失败抛出，由调用方决定怎么提示
+        async setForwarding(enable) {
+            const ip = (this.serverInst && this.serverInst.self && this.serverInst.self.vpn_ip) || this.vpnIp;
+
+            const res = await fetch(`${this.$api}/tunnel/forward`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip, enable }),
+            });
+            const result = await res.json();
+            if (!res.ok || result.error) {
+                throw new Error(result.error || `设置 IPv4 转发出错（HTTP ${res.status}）`);
             }
             return result;
         },

@@ -45,3 +45,10 @@ database.db
 # ==============================
 package-lock.json
 yarn.lock
+
+# ==============================
+# Bundled WireGuard binaries (drop manually, see core/wg/README.md)
+# ==============================
+core/wg/*.exe
+core/wg/*.dll
+core/*.exe~
