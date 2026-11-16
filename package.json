@@ -3,7 +3,7 @@
 	"version": "1.0.0",
 	"author": "Cirnotsuki",
 	"description": "基于 WireGuard 的 Windows 虚拟局域网组网工具，支持一键创建或加入网络，实现多设备安全互联。",
-	"license": "MIS",
+	"license": "MIT",
 	"homepage": "https://github.com/cirnotsuki",
 	"main": "./dist/main.js",
 	"scripts": {
