@@ -1,6 +1,6 @@
 {
 	"name": "electron-vue-template",
-	"version": "1.1.15",
+	"version": "1.0.0",
 	"author": "Cirnotsuki",
 	"description": "electron-vue template of Elcectron 22 ",
 	"license": "MIS",
@@ -10,7 +10,9 @@
 		"dev": "node .electron-vue/dev-runner.js",
 		"build": "node .electron-vue/build.js",
 		"pack": "npm run build && electron-builder --dir",
-		"builder": "electron-builder --dir"
+		"builder": "electron-builder --dir",
+		"sign": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/signpath-sign.ps1 -Files \"dist/ka-vlan/win-unpacked/KA VLAN.exe\",\"dist/ka-vlan/win-unpacked/resources/core/vlancore.exe\"",
+		"release": "npm run pack && npm run sign"
 	},
 	"build": {
 		"appId": "com.vlan.app",
