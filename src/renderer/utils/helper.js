@@ -226,7 +226,7 @@ export function getQuery(name) {
 export function getRootFolder(...arg) {
     // 获取根目录
     // eslint-disable-next-line no-undef
-    const LocalPath = process.env.NODE_ENV === 'development' ? path.resolve(__static, '..') : path.dirname(process.resourcesPath);
+    const LocalPath = process.env.NODE_ENV === 'development' ? path.resolve(__static, '..') : process.resourcesPath;
 
     // 创建文件路径
     const filePath = [];
