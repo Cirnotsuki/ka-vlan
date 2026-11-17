@@ -64,17 +64,17 @@ WireGuard 默认安装目录为 `C:\Program Files\WireGuard`，程序需要使�
 
 ```text
 ┌────────────────────────────── 渲染进程（Vue，nodeIntegration: true）──────────────────────────────┐
-│  src/renderer/pages/home.vue    界面：加入服务器 / 开启服务 / 成员表 / 网卡开关                    │
+│  src/renderer/pages/home.vue    界面：加入服务器 / 开启服务 / 成员表 / 网卡开关                     │
 │  src/renderer/utils/server.js   注册服务：/api/join、/api/state                                   │
-│  src/renderer/utils/sqlite.js   调用 core\\sqlite3.exe 读写 database.db                            │
-│  src/renderer/utils/helper.js   密钥生成、conf 工具、隧道启停、IPv4 转发                           │
+│  src/renderer/utils/sqlite.js   调用 core\\sqlite3.exe 读写 database.db                           │
+│  src/renderer/utils/helper.js   密钥生成、conf 工具、隧道启停、IPv4 转发                            │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
                  │ IPC                                      │ HTTP 127.0.0.1:7400
                  ▼                                          ▼
 ┌──────────────────────────────┐              ┌────────────────────────────────────────────────────┐
-│       Electron 主进程        │              │              Go 核心 vlancore                     │
-│  窗口、单实例、核心生命周期  │              │  /tunnel/up、/tunnel/down、/tunnel/peer           │
-│  poller.js 状态轮询           │              │  对 wireguard.exe / wg.exe 的轻量封装             │
+│       Electron 主进程         │              │              Go 核心 vlancore                      │
+│  窗口、单实例、核心生命周期     │              │  /tunnel/up、/tunnel/down、/tunnel/peer            │
+│  poller.js 状态轮询           │              │  对 wireguard.exe / wg.exe 的轻量封装               │
 └──────────────────────────────┘              └────────────────────────────────────────────────────┘
 ```
 
