@@ -27,41 +27,39 @@ if (process.env.NODE_ENV !== 'development') {
 export const WindowTitle = 'KA-VLAN 组网';
 
 // —— userData 目录初始化：稳定落在 %APPDATA%\vlan（次选 %LOCALAPPDATA%\vlan），实测可写才启用 ——
-// 五段探针逐段记录失败点：mkdir → open → write → close → unlink
-function probeWritableDir(dir) {
-    const stages = [];
-    let probe = '';
-    try {
-        stages.push('mkdir');
-        fs.mkdirSync(dir, { recursive: true });
-        probe = path.join(dir, `write-probe-${process.pid}.txt`);
-        stages.push('open');
-        const fd = fs.openSync(probe, 'w');
-        stages.push('write');
-        fs.writeSync(fd, 'probe');
-        stages.push('close');
-        fs.closeSync(fd);
-        stages.push('unlink');
-        fs.unlinkSync(probe);
-        return null; // null = 可写
-    } catch (e) {
-        e.failedStage = stages[stages.length - 1] || '(init)';
-        return e;
-    }
-}
+// 五段探针逐段记录失败点：mkdir → open/write → close → unlink；探针文件名带 pid + 随机串防并发冲突
+async function probeWritableDir(dir) {
+    const rand = Math.random().toString(36).slice(2, 8);
+    const probe = path.join(dir, `write-probe-${process.pid}-${rand}.tmp`);
+    const result = { ok: false, stage: '', err: null, probeFile: probe };
 
-// 交叉诊断：用 cmd.exe 子进程往同一目录写探针（区分「目录被限制」还是「本 exe 被安全软件针对」）
-function cmdWriteProbe(dir) {
+    let handle = null;
     try {
-        const file = path.join(dir, `.cmd-probe-${process.pid}.txt`);
-        const r = require('child_process').execSync(`cmd /c echo probe > "${file}"`, { timeout: 5000, windowsHide: true });
-        const ok = fs.existsSync(file);
-        try {
-            fs.unlinkSync(file);
-        } catch (_) {}
-        return ok ? 'cmd.exe 写入成功' : 'cmd.exe 执行后文件不存在';
+        result.stage = 'mkdir';
+        await fs.promises.mkdir(dir, { recursive: true });
+
+        result.stage = 'write';
+        handle = await fs.promises.open(probe, 'w');
+        await handle.writeFile('probe', 'utf8');
+
+        result.stage = 'close';
+        await handle.close();
+        handle = null;
+
+        result.stage = 'unlink';
+        await fs.promises.unlink(probe);
+
+        result.ok = true;
+        return result;
     } catch (e) {
-        return `cmd.exe 也写不进: code=${e.code || e.status} ${(e.message || '').slice(0, 120)}`;
+        result.err = e;
+        if (handle) {
+            try { await handle.close(); } catch (_) { /* 尽力关闭 */ }
+        }
+        if (result.stage !== 'unlink') {
+            try { await fs.promises.unlink(probe); } catch (_) { /* 清理失败不掩盖原始错误 */ }
+        }
+        return result;
     }
 }
 
@@ -76,7 +74,7 @@ function processIdentity() {
     }
 }
 
-function initUserData() {
+async function initUserData() {
     console.log('[VLAN] 进程身份:', processIdentity());
     const candidates = [path.join(process.env.APPDATA || '', 'vlan'), path.join(process.env.LOCALAPPDATA || '', 'vlan')].filter(
         (p) => p && p.length > 3,
@@ -84,69 +82,90 @@ function initUserData() {
 
     const errors = [];
     for (const dir of candidates) {
-        const err = probeWritableDir(dir);
-        if (!err) {
+        const r = await probeWritableDir(dir);
+        if (r.ok) {
             app.setPath('userData', dir);
-            console.log('[VLAN] userData =', dir, '（五段探针全部通过）');
+            console.log('[VLAN] userData =', dir, '（探针全部通过：mkdir/open/write/close/unlink）');
             return dir;
         }
-        const cross = cmdWriteProbe(dir);
         errors.push(
-            `目录 ${dir} 不可写 | 失败阶段=${err.failedStage} code=${err.code} syscall=${err.syscall} path=${err.path} | ${err.message} | [交叉] ${cross}`,
+            `目录 ${dir} 不可写 | 失败阶段=${r.stage} code=${r.err.code} syscall=${r.err.syscall} path=${r.probeFile} | ${r.err.message}`,
         );
     }
-    console.error('[VLAN] userData 初始化失败，所有候选均不可写，退出：');
+    console.error('[VLAN] userData 初始化失败，所有候选均不可写，退出（不回退 Temp）：');
     errors.forEach((s) => console.error(`  - ${s}`));
-    console.error('[VLAN] 判读：cmd.exe 能写而本进程不能 → 安全软件在针对本 exe；cmd.exe 也不能写 → 目录/策略层面限制');
     shellLog(`userData 初始化失败: ${errors.join(' | ')}`);
     dialog.showErrorBox(WindowTitle, `应用数据目录初始化失败：\n${errors.join('\n')}\n\n详见 shell 日志`);
     app.exit(1);
     return null;
 }
 
-const vlanUserData = initUserData();
-if (vlanUserData === null) {
-    // initUserData 内部已弹窗并退出，这里兜底防继续执行
-    throw new Error('userData 初始化失败');
-}
+// —— 异步引导：userData 就绪后再注册单实例锁与窗口生命周期（顺序：先 userData，后单例锁） ——
+(async () => {
+    const vlanUserData = await initUserData();
+    if (vlanUserData === null) {
+        // initUserData 内部已弹窗并调用 app.exit(1)，这里不再继续
+        return;
+    }
+    process.env.ElectronAppUserPath = app.getPath('userData');
+    bootstrapApp();
+})();
 
-process.env.ElectronAppUserPath = app.getPath('userData');
+// —— VLAN 壳日志系统：优先落盘到「应用目录\logs\」，不可写时逐级回退；全失败留内存 ——
+const shellLogLines = [];
+let shellLogPath = null;
 
-// —— VLAN 壳日志系统：%LOCALAPPDATA%\vlan\logs\shell-日期.log ——
-let shellLogPath = path.join(
-    process.env.LOCALAPPDATA || os.tmpdir(),
-    'vlan',
-    'logs',
-    `shell-${new Date().toISOString().slice(0, 10)}.log`,
-);
-try {
-    fs.mkdirSync(path.dirname(shellLogPath), { recursive: true });
-} catch (_) {
-    shellLogPath = null; // 日志目录同样可能不可写，退化成不写日志，不影响启动
-}
 function shellLog(msg) {
+    const line = `${new Date().toISOString()} ${msg}`;
+    shellLogLines.push(line);
     if (process.env.NODE_ENV === 'development') {
         console.log(`[shellLog] ${msg}`);
     }
-    if (!shellLogPath) return;
     try {
-        fs.appendFileSync(shellLogPath, `${new Date().toISOString()} ${msg}\n`);
+        if (shellLogPath) {
+            fs.appendFileSync(shellLogPath, `${line}\n`);
+            return;
+        }
+        // 首次落盘：确定一个可写目录后固定使用
+        const appDir = app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath();
+        const candidates = [
+            path.join(appDir, 'logs'), // 应用目录（打包后主位置）
+            path.join(process.env.LOCALAPPDATA || '', 'vlan', 'logs'),
+            path.join(process.env.APPDATA || '', 'vlan', 'logs'),
+            path.join(os.tmpdir(), 'vlan', 'logs'),
+            path.join(process.env.PUBLIC || '', 'vlan', 'logs'),
+        ].filter((p) => p && p.length > 3);
+
+        for (const dir of candidates) {
+            try {
+                fs.mkdirSync(dir, { recursive: true });
+                const p = path.join(dir, `shell-${new Date().toISOString().slice(0, 10)}.log`);
+                fs.appendFileSync(p, `${shellLogLines.join('\n')}\n`);
+                shellLogPath = p;
+                console.log('[VLAN] shell 日志落盘:', p);
+                return;
+            } catch (_) {
+                /* 试下一个候选目录 */
+            }
+        }
+        // 全部不可写：日志留在内存（shellLogLines），退出时由弹窗兜底展示
     } catch (_) {
         /* 日志失败不致命 */
     }
 }
 shellLog('=== shell 启动 ===');
 
-// GPU：默认不禁用（Chromium 会自动回退软件渲染）。若确认环境不支持，设 VLAN_DISABLE_GPU=1 关闭
-if (process.env.VLAN_DISABLE_GPU === '1') {
-    app.disableHardwareAcceleration();
-    console.log('[VLAN] 已按 VLAN_DISABLE_GPU=1 禁用硬件加速');
-}
-
-// win7 禁用硬件加速（程序黑屏）
-if (os.release().startsWith('6.1')) {
-    app.disableHardwareAcceleration();
-}
+// GPU：无条件在 app ready 之前禁用硬件加速，走软件渲染。
+// 本机实测 GPU 进程启动即失败（error_code=18 → FATAL GPU process isn't usable），
+// 为保证 Windows 10 设备能正常启动窗口，一律软件渲染；如需恢复硬件加速再按机器差异开关。
+// 注意：这是禁用硬件加速，不是关闭 GPU sandbox。
+app.disableHardwareAcceleration();
+// 兜底开关：GPU 子进程创建在本机持续失败（error_code=18，子进程被安全软件沙箱掐断），
+// Chromium 会因此在子进程多次失败后 FATAL 退出。--in-process-gpu 让 GPU 跑在主进程内，
+// 不再创建 GPU 子进程；这不是关闭 GPU sandbox，也不改系统显卡驱动。
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('in-process-gpu');
+shellLog('GPU: 已禁用硬件加速（软件渲染）+ in-process-gpu，调用时机 = app ready 之前');
 
 const CORE_PORT = 7400;
 
@@ -395,14 +414,16 @@ ipcMain.on('tray:need-window', () => {
 });
 
 // 限制单实例应用（必须在 userData 初始化之后：单例锁就存在 userData 目录里）
-const curInstance = app.requestSingleInstanceLock();
-if (!curInstance) {
-    console.error(
-        '[VLAN] 获取单实例锁失败：已有实例在运行，或同一 userData 目录被其他进程占用（可用任务管理器清理残留的 electron.exe / VLAN 组网.exe）',
-    );
-    shellLog('单实例锁获取失败，退出');
-    app.quit();
-} else {
+function bootstrapApp() {
+    const curInstance = app.requestSingleInstanceLock();
+    if (!curInstance) {
+        console.error(
+            '[VLAN] 获取单实例锁失败：已有实例在运行，或同一 userData 目录被其他进程占用（可用任务管理器清理残留的 electron.exe / VLAN 组网.exe）',
+        );
+        shellLog('单实例锁获取失败，退出');
+        app.quit();
+        return;
+    }
     shellLog(`单实例锁获取成功，userData=${app.getPath('userData')}`);
     app.on('second-instance', () => {
         if (mainWindow) {
@@ -435,6 +456,8 @@ if (!curInstance) {
             });
     });
 }
+
+// —— 异步引导入口见上方 initUserData() 的调用处 ——
 
 app.on('window-all-closed', async () => {
     shellLog('window-all-closed: 停核心');

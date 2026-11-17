@@ -1,10 +1,10 @@
 {
 	"name": "ka-vlan",
 	"version": "1.0.0",
-	"author": "Cirnotsuki",
+	"author": "Kuzuki Azusa",
 	"description": "基于 WireGuard 的 Windows 虚拟局域网组网工具，支持一键创建或加入网络，实现多设备安全互联。",
 	"license": "MIT",
-	"homepage": "https://github.com/cirnotsuki",
+	"homepage": "https://github.com/cirnotsuki/ka-vlan",
 	"main": "./dist/main.js",
 	"scripts": {
 		"dev": "node .electron-vue/dev-runner.js",
@@ -16,7 +16,7 @@
 	},
 	"build": {
 		"appId": "com.vlan.app",
-		"productName": "KA VLAN",
+		"productName": "ka-vlan",
 		"directories": {
 			"output": "./dist/ka-vlan"
 		},
