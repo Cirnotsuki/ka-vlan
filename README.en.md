@@ -64,22 +64,8 @@ Default port values are defined by constants such as `DEFAULT_SERVER_PORT` and `
 
 The application consists primarily of an Electron desktop client and a Go core:
 
-```text
-┌────────────────────────────── Renderer Process (Vue, nodeIntegration: true) ──────────────────────────────┐
-│  src/renderer/pages/home.vue    UI: join server / start service / member list / adapter toggle           │
-│  src/renderer/utils/server.js   Registration API: /api/join, /api/state                                  │
-│  src/renderer/utils/sqlite.js   Uses core\\sqlite3.exe to read and write database.db                       │
-│  src/renderer/utils/helper.js   Key generation, conf utilities, tunnel control, IPv4 forwarding           │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                 │ IPC                                      │ HTTP 127.0.0.1:7400
-                 ▼                                          ▼
-┌──────────────────────────────┐              ┌────────────────────────────────────────────────────┐
-│       Electron Main Process  │              │              Go Core: vlancore                    │
-│  Window, single instance,    │              │  /tunnel/up, /tunnel/down, /tunnel/peer            │
-│  core lifecycle              │              │  Lightweight wrapper for wireguard.exe / wg.exe  │
-│  poller.js status polling    │              │                                                    │
-└──────────────────────────────┘              └────────────────────────────────────────────────────┘
-```
+<img width="1536" height="1024" alt="ad7c99f0-3ea3-4e81-ba2d-db03ba67e8ea" src="https://github.com/user-attachments/assets/c2bcb94d-93dc-48fe-905a-a68e321e1119" />
+
 
 ### Why Is Polling Handled by the Main Process?
 
