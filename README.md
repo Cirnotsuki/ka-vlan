@@ -1,3 +1,5 @@
+[简体中文](README.md) | [English](README.en.md)
+
 # KA-VLAN
 
 **KA-VLAN** 是一款面向 Windows 的桌面端虚拟局域网组网工具，基于 **WireGuard** 实现设备间互联。
