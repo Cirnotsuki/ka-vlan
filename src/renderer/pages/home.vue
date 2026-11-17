@@ -579,7 +579,7 @@ PersistentKeepalive = 25`;
         },
 
         // 主进程推来的节点状态（加入服务器后按 4 秒 / 长轮询拉 /api/state）
-        async onNodeState(payload) {
+        async onNodeState(e, payload) {
             if (!payload) return;
 
             if (!payload.ok) {
@@ -608,9 +608,12 @@ PersistentKeepalive = 25`;
                 if (conf !== this.lastTunnelConf) {
                     await this.hotUpdateServerPeers(conf);
                 }
+
+                this.portOK = true;
             } catch (e) {
                 // 这里抛出去会变成 unhandledrejection（IPC 回调没人 await）
                 this.joinErr = this.translateErr(e.message);
+                this.portOK = false;
             }
         },
 

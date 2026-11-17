@@ -98,7 +98,8 @@ body {
 
                         }
 
-                        th, td {
+                        th,
+                        td {
                             text-align: center;
                         }
 
@@ -110,6 +111,44 @@ body {
                         .bad {
                             color: var(--bad);
                             font-weight: 600;
+                        }
+
+                        .el-descriptions {
+                            width: 100%;
+                            max-height: calc(100vh - 380px);
+                            border-radius: 6px;
+                            overflow-y: auto;
+
+                            scrollbar-width: thin;
+                            scrollbar-color: #8995a5 #e5e9ef;
+
+                            &::-webkit-scrollbar {
+                                width: 8px;
+                                height: 8px;
+                            }
+
+                            &::-webkit-scrollbar-track {
+                                background: #e5e9ef;
+                                border-radius: 0 6px 6px 0;
+                            }
+
+                            &::-webkit-scrollbar-thumb {
+                                background: #8995a5;
+                                border: 2px solid #e5e9ef;
+                                border-radius: 6px;
+                            }
+
+                            &::-webkit-scrollbar-thumb:hover {
+                                background: #64748b;
+                            }
+
+                            &::-webkit-scrollbar-thumb:active {
+                                background: #475569;
+                            }
+
+                            &::-webkit-scrollbar-corner {
+                                background: transparent;
+                            }
                         }
                     }
                 }

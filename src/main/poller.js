@@ -125,16 +125,19 @@ export default class Poller {
         let next = intervalMs;
 
         try {
-            // 长轮询时服务端会挂住连接直到有变化，所以超时要放宽
+            // 长轮询允许服务端长时间保持连接
             const timeout = longPoll ? Math.max(intervalMs, 30000) : Math.min(intervalMs, 4000);
-            const startAt = +new Date();
+            const startAt = Date.now();
             const res = await requestOnce(url, { timeout });
 
             if (!this.stateOpts) return;
 
+            // 长轮询响应后稍作等待，避免高频重连
+            const nextInterval = longPoll ? Math.max(1000, Math.min(intervalMs, 3000)) : intervalMs;
+
             if (res.status === 204) {
-                // 长轮询心跳：没有变化，立刻再来
-                next = longPoll ? 0 : intervalMs;
+                next = nextInterval;
+
                 this._send('poll:state', { ok: true, empty: true, at: Date.now() });
             } else if (res.status >= 200 && res.status < 300) {
                 let data = null;
@@ -146,8 +149,11 @@ export default class Poller {
                 this._send('poll:state', {
                     ok: true, data, at: Date.now(), startAt,
                 });
-                next = longPoll ? 0 : intervalMs;
+
+                next = nextInterval;
             } else {
+                next = intervalMs;
+
                 this._send('poll:state', {
                     ok: false,
                     error: `HTTP ${res.status}`,
@@ -155,6 +161,8 @@ export default class Poller {
                 });
             }
         } catch (e) {
+            next = intervalMs;
+
             this._send('poll:state', { ok: false, error: e.message || String(e), at: Date.now() });
         }
 

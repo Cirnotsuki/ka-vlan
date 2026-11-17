@@ -15,4 +15,4 @@ export const ST_BANNED = 0;
 export const ST_NORMAL = 1;
 
 export const MAX_BODY = 1024 * 1024;
-export const IS_LOST_CONNECT = 30 * 1000;
+export const IS_LOST_CONNECT = 5 * 1000;

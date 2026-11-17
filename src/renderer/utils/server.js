@@ -212,7 +212,6 @@ SELECT changes() AS changes;`);
             throw Object.assign(new Error('设备信息出错'), { status: 400 });
         }
 
-        this._refreshStat(publicKey);
         const members = await this.members();
 
         let joinErr = '';
@@ -221,6 +220,10 @@ SELECT changes() AS changes;`);
         }
 
         const me = members.find((u) => u.public_key === publicKey) || {};
+
+        this._refreshStat(publicKey);
+
+        this.onConnect();
 
         return {
             joinErr,
@@ -283,6 +286,8 @@ SELECT changes() AS changes;`);
         result.serverKey = this.self.public_key;
         result.wgPort = this.wgPort;
         result.peers = (await this.members()).map((u) => this._toMember(u));
+
+        this._refreshStat(publicKey);
 
         this.onConnect();
         return result;
