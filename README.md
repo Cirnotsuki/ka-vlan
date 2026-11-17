@@ -62,8 +62,7 @@ WireGuard 默认安装目录为 `C:\Program Files\WireGuard`，程序需要使�
 
 项目主要由 Electron 桌面端和 Go 核心组成：
 
-![Uploading image.png…]()
-
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/c987c0b5-540e-42a2-af82-59e9d55d1fe1" />
 
 ### 为什么轮询由主进程负责？
 
