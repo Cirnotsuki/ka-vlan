@@ -259,8 +259,20 @@ Hub 必须开启 IPv4 转发。点击界面中的「开启服务」后，程序�
 可以使用 PowerShell 检查 WireGuard 网卡：
 
 ```powershell
-Get-NetIPInterface -AddressFamily IPv4 |
-  Where-Object { $_.InterfaceAlias -like '*Usagi*' }
+$interface = Get-NetIPAddress -IPAddress '10.84.111.1' -AddressFamily IPv4 -ErrorAction SilentlyContinue
+if ($interface) { Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 }
+```
+
+如果程序未能自动开启 IPv4 转发，可以用管理员权限运行 PowerShell 并执行以下代码
+
+```powershell
+[System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$interface = Get-NetIPAddress -IPAddress '10.84.111.1' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+Set-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 -Forwarding Enabled -ErrorAction Stop
+$result = Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4
+if ($result.Forwarding -ne 'Enabled') { throw 'IPv4 forwarding verification failed.' }
+Write-Output 'IPv4 forwarding enabled.'
 ```
 
 ### curl 调用本地接口没有响应
