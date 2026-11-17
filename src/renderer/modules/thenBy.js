@@ -1,4 +1,4 @@
-module.exports = (function tbe() {
+export default (function tbe() {
     function id(v) {
         return v;
     }

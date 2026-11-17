@@ -21,7 +21,6 @@ export default class TrayManager {
     // static 目录随启动形态漂移：仓库根（dev）、dist（以 dist 为 app 根）、resources/app（打包）、resources
     staticDir() {
         const appPath = this.opts.getAppPath();
-        console.log(appPath);
         const candidates = [
             path.join(appPath, 'static'),
             path.join(appPath, 'dist', 'static'),

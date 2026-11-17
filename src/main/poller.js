@@ -126,7 +126,7 @@ export default class Poller {
 
         try {
             // 长轮询允许服务端长时间保持连接
-            const timeout = longPoll ? Math.max(intervalMs, 30000) : Math.min(intervalMs, 4000);
+            const timeout = longPoll ? Math.max(intervalMs, 6000) : Math.min(intervalMs, 4000);
             const startAt = Date.now();
             const res = await requestOnce(url, { timeout });
 

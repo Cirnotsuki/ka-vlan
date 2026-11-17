@@ -223,8 +223,6 @@ SELECT changes() AS changes;`);
 
         this._refreshStat(publicKey);
 
-        this.onConnect();
-
         return {
             joinErr,
             wgPort: this.wgPort,
@@ -287,7 +285,7 @@ SELECT changes() AS changes;`);
         result.wgPort = this.wgPort;
         result.peers = (await this.members()).map((u) => this._toMember(u));
 
-        this._refreshStat(publicKey);
+        this._refreshStat(publicKey, true);
 
         this.onConnect();
         return result;
@@ -328,14 +326,17 @@ SELECT changes() AS changes;`);
         throw Object.assign(new Error('地址分配冲突，请重试'), { status: 409 });
     }
 
-    _refreshStat(publicKey) {
+    _refreshStat(publicKey, onLogin = false) {
         if (!this.userStat.has(publicKey)) {
             this.userStat.set(publicKey, {
-                lastConnect: +new Date(),
-                lastHeartBeat: +new Date(),
+                lastConnect: Date.now(),
+                lastHeartBeat: Date.now(),
             });
         }
-        this.userStat.get(publicKey).lastHeartBeat = +new Date();
+        if (onLogin) {
+            this.userStat.get(publicKey).lastConnect = Date.now();
+        }
+        this.userStat.get(publicKey).lastHeartBeat = Date.now();
     }
 
     // 获取客户端真实 IP
@@ -378,16 +379,37 @@ SELECT changes() AS changes;`);
             ...this.userStat.get(row.public_key),
         };
 
-        const curTime = +new Date();
-        const keepHeartBeat = curTime - stat.lastHeartBeat < IS_LOST_CONNECT;
+        const keepHeartBeat = Date.now() - stat.lastHeartBeat < IS_LOST_CONNECT;
         const banded = this.banUsers.some((u) => u.guid === row.guid || u.publicKey === row.public_key || u.ip.indexOf(row.ip) >= 0);
 
         return {
             id: row.id,
             name: row.name || '匿名',
             lastConnect: stat.lastConnect,
+            lastHeartBeat: stat.lastHeartBeat,
             online: keepHeartBeat && !banded,
         };
+    }
+
+    getClientStat() {
+        const now = Date.now();
+
+        return new Map(
+            Array.from(this.userStat.entries()).map(([key, stat]) => {
+                const keepHeartBeat = now - stat.lastHeartBeat < IS_LOST_CONNECT;
+                const banned = this.banUsers.some((u) => u.guid === key);
+
+                return [
+                    key,
+                    {
+                        online: keepHeartBeat && !banned,
+                        lastHeartBeat: stat.lastHeartBeat,
+                        lastConnect: stat.lastConnect,
+                        banned,
+                    },
+                ];
+            }),
+        );
     }
 
     /**
@@ -407,7 +429,7 @@ SELECT changes() AS changes;`);
             id: u.id, // 用户ID
             name: u.name, // 用户名称
             // 随机生成一个过去30天内的最后连接时间
-            lastConnect: +new Date() - Math.random() * 1000 * 60 * 60 * 24 * 30,
+            lastConnect: Date.now() - Math.random() * 1000 * 60 * 60 * 24 * 30,
             // 假设ID大于2的用户为在线状态
             online: u.id > 2,
         }));

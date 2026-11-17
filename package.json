@@ -1,6 +1,6 @@
 {
 	"name": "ka-vlan",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"author": "Kuzuki Azusa",
 	"description": "基于 WireGuard 的 Windows 虚拟局域网组网工具，支持一键创建或加入网络，实现多设备安全互联。",
 	"license": "MIT",
@@ -22,6 +22,9 @@
 		},
 		"files": [
 			"dist/**/*",
+			"!dist/ka-vlan/**",
+			"!dist/**/win-unpacked/**",
+			"!dist/**/*.zip",
 			"static/**/*",
 			"package.json",
 			"!core/**"
@@ -99,9 +102,8 @@
 		"webpack-dev-server": "^3.1.4",
 		"webpack-hot-middleware": "^2.22.2",
 		"webpack-merge": "^4.1.3",
-		"webpack-obfuscator": "^2.6.0"
-	},
-	"dependencies": {
+		"webpack-obfuscator": "^2.6.0",
 		"element-ui": "^2.15.14"
-	}
+	},
+	"dependencies": {}
 }

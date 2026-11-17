@@ -59,16 +59,32 @@
                                     <el-popover trigger="hover" placement="top">
                                         <el-descriptions class="margin-top" :column="1" size="small " border>
                                             <el-descriptions-item>
-                                                <template slot="label"> 公钥: </template>
+                                                <template slot="label">公钥</template>
                                                 <span> {{ scope.row.public_key }}</span>
                                             </el-descriptions-item>
                                             <el-descriptions-item>
-                                                <template slot="label"> IP: </template>
+                                                <template slot="label">IP</template>
                                                 <span> {{ scope.row.ip }}</span>
                                             </el-descriptions-item>
                                             <el-descriptions-item>
-                                                <template slot="label"> 上次握手时间: </template>
-                                                <span> {{ scope.row.lastConnect ? new Date() : "-" }}</span>
+                                                <template slot="label">上次握手时间</template>
+                                                <span>
+                                                    {{
+                                                        scope.row.lastConnect
+                                                            ? formatDate(new Date(scope.row.lastConnect), "yyyy年MM月dd日 HH:mm:ss")
+                                                            : "-"
+                                                    }}</span
+                                                >
+                                            </el-descriptions-item>
+                                            <el-descriptions-item>
+                                                <template slot="label">本连接已持续</template>
+                                                <span :class="{ offline: !scope.row.online }">
+                                                    {{
+                                                        scope.row.lastConnect && scope.row.lastHeartBeat
+                                                            ? Math.floor((scope.row.lastHeartBeat - scope.row.lastConnect) / 1000) + "秒"
+                                                            : "已离线"
+                                                    }}</span
+                                                >
                                             </el-descriptions-item>
                                         </el-descriptions>
                                         <div slot="reference" class="name-wrapper">
@@ -269,7 +285,7 @@ import { getMachineGuid, formatDate } from '../utils/helper';
 // 对应 ui/index.html 的 Vue 页面版：
 // 状态全部走 vlancore 的 127.0.0.1:7400 HTTP API
 import {
-    DEFAULT_WG_PORT, DEFAULT_SERVER_PORT, SERVER_VPN_IP, NETWORK_NAME, LOCAL_NAME,
+    DEFAULT_WG_PORT, DEFAULT_SERVER_PORT, SERVER_VPN_IP, NETWORK_NAME, LOCAL_NAME, IS_LOST_CONNECT,
 } from '../constants';
 
 // 轮询在主进程里跑，这里只通过 ipc 起停 + 收结果（nodeIntegration 开着，可直接 require）
@@ -308,6 +324,7 @@ export default {
             wgPort: `${DEFAULT_WG_PORT}`,
             networkName: NETWORK_NAME,
             members: [],
+            clientStateTimeout: 0,
 
             memberCount: 0,
             // 加入服务器后的节点状态（主进程轮询 /api/state 推送）
@@ -584,6 +601,10 @@ PersistentKeepalive = 25`;
 
             if (!payload.ok) {
                 this.joinErr = payload.error || '获取节点状态失败';
+                this.memberCount = Number.NaN; // peers 包含自己的
+                this.peers = [];
+                this.latencyMs = Number.NaN;
+                this.portOK = false;
                 return;
             }
 
@@ -622,7 +643,10 @@ PersistentKeepalive = 25`;
             const connected = this.mode === 'serve' ? !!this.tunnelUp : this.mode === 'join' ? !!this.tunnelUp : false;
 
             ipcRenderer.send('tray:state', {
-                mode: this.onStopProcess ? 'stoping' : this.mode, connected, vpnIp: this.vpnIp, joinErr: this.joinErr,
+                mode: this.onStopProcess ? 'stoping' : this.mode,
+                connected,
+                vpnIp: this.vpnIp,
+                joinErr: this.joinErr,
             });
         },
         onTrayAction(evt, action) {
@@ -663,6 +687,34 @@ PersistentKeepalive = 25`;
 
         async onConnect() {
             await this.refreshMenbers();
+        },
+
+        async loopClientState() {
+            clearTimeout(this.clientStateTimeout);
+
+            if (!this.serverInst || this.mode !== 'serve') return;
+
+            try {
+                await this.serverInst.ready;
+
+                const statMap = this.serverInst.getClientStat();
+
+                this.members.forEach((u) => {
+                    const stat = statMap.get(u.public_key);
+
+                    if (stat) {
+                        u.online = stat.online;
+                        u.lastHeartBeat = stat.online ? Date.now() : 0;
+                    } else {
+                        u.online = false;
+                        u.lastHeartBeat = 0;
+                    }
+                });
+            } finally {
+                this.clientStateTimeout = setTimeout(() => {
+                    this.loopClientState();
+                }, 1000);
+            }
         },
 
         // 独立的热更新：不重装隧道，把 conf 里的 [Peer] 增量同步进运行中的接口。
@@ -736,6 +788,8 @@ PersistentKeepalive = 25`;
                     this.$message.error(this.translateErr(e.message));
                 }
             }
+
+            this.loopClientState();
             this.pollState();
             this.pushTrayState();
         },
@@ -825,9 +879,11 @@ PersistentKeepalive = 25`;
                 this.mode = 'join';
 
                 // 加入成功：把真实的 /api/state 地址交给主进程去轮询（4 秒一轮，长轮询）
+                // 通过建立的隧道发送，同时验证隧道是否通畅
                 // 带上 publicKey：服务端要按它算"我是谁"、返回我的 vpn_ip
+                const hostIp = this.vpnIp.replace(/\d+$/, '1');
                 ipcRenderer.send('poll:state:start', {
-                    url: `http://${this.ip}:${serverPort}/api/state?publicKey=${encodeURIComponent(info.public_key)}`,
+                    url: `http://${hostIp}:${serverPort}/api/state?publicKey=${encodeURIComponent(info.public_key)}`,
                     intervalMs: 4000,
                     longPoll: true,
                 });
