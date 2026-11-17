@@ -261,11 +261,22 @@ To check the WireGuard adapter by its configured virtual IP address (replace the
 
 ```powershell
 $interface = Get-NetIPAddress -IPAddress '10.84.111.1' -AddressFamily IPv4 -ErrorAction SilentlyContinue
-
-if ($interface) {
-    Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4
-}
+if ($interface) { Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 }
 ```
+
+If the application fails to enable IPv4 forwarding automatically, open PowerShell as an administrator and run the following commands.
+
+```powershell
+[System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$interface = Get-NetIPAddress -IPAddress '10.84.111.1' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
+Set-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 -Forwarding Enabled -ErrorAction Stop
+$result = Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4
+if ($result.Forwarding -ne 'Enabled') { throw 'IPv4 forwarding verification failed.' }
+Write-Output 'IPv4 forwarding enabled.'
+```
+
+If the application fails to enable IPv4 forwarding automatically, open PowerShell as an administrator and run the following commands.
 
 ### curl Cannot Reach the Local API
 
